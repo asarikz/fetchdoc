@@ -6,6 +6,7 @@
 
 use clap::{Args, Subcommand};
 
+mod eml;
 mod gmail;
 
 #[derive(Args, Debug)]
@@ -18,10 +19,13 @@ pub struct FetchArgs {
 enum FetchCommand {
     /// Fetch invoice attachments from Gmail.
     Gmail(gmail::GmailArgs),
+    /// Pull PDF attachments out of locally-stored `.eml` files.
+    Eml(eml::EmlArgs),
 }
 
 pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
     match args.command {
         FetchCommand::Gmail(a) => gmail::run(a).await,
+        FetchCommand::Eml(a) => eml::run(a).await,
     }
 }

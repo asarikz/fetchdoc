@@ -50,6 +50,23 @@ brew install asarikz/tap/fetchdoc
 Pre-built binaries for Linux, macOS, and Windows will be attached to each
 GitHub Release once the v0.1 milestone closes.
 
+## Local mail import (no OAuth)
+
+If you'd rather not — or can't — set up a Google Cloud OAuth client, point
+fetchdoc at a folder of `.eml` files instead. Apple Mail, Thunderbird,
+Outlook, Google Takeout, and `offlineimap` / `mbsync` can all produce these.
+
+```sh
+# Drop a few .eml files into ~/mail-export/ first.
+fetchdoc fetch eml --dir ~/mail-export --since 2026-04-01 > raw.jsonl
+ANTHROPIC_API_KEY=sk-ant-... fetchdoc classify < raw.jsonl > classified.jsonl
+fetchdoc export local --root ~/受領請求書 < classified.jsonl
+```
+
+`fetch eml` recurses into subdirectories, extracts every PDF attachment into
+a cache directory, and emits the same Document JSONL that `fetch gmail`
+will produce — so the rest of the pipeline is identical.
+
 ## Quick start
 
 ```sh
@@ -80,6 +97,7 @@ fetchdoc export gnucash \
 |---|---|---|
 | `auth init / login / status / logout` | — | OS keychain |
 | `fetch gmail` | — | JSONL of `Document` records |
+| `fetch eml --dir PATH` | — | JSONL of `Document` records (no OAuth) |
 | `classify [--ocr=anthropic\|vertex\|openai]` | JSONL | JSONL with `extracted` field |
 | `export local --root PATH` | JSONL | files + JSONL with `exported` field |
 | `export gnucash --out CSV` | JSONL | CSV file + JSONL |
