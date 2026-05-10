@@ -8,6 +8,7 @@
 //! Auth: `ANTHROPIC_API_KEY` from the environment. Model: defaults to
 //! [`DEFAULT_MODEL`], overridable per-call or via `FETCHDOC_ANTHROPIC_MODEL`.
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -59,13 +60,40 @@ impl Client {
         user: &str,
         max_tokens: u32,
     ) -> anyhow::Result<String> {
+        self.complete_with_blocks(system, &[UserBlock::Text(user.into())], max_tokens)
+            .await
+    }
+
+    /// Single-turn completion with a heterogeneous user message — text + PDF
+    /// document blocks. PDF bytes are base64-encoded and sent as `document`
+    /// content blocks per the Messages API spec.
+    pub async fn complete_with_blocks(
+        &self,
+        system: &str,
+        blocks: &[UserBlock],
+        max_tokens: u32,
+    ) -> anyhow::Result<String> {
+        let content: Vec<ContentBlockOut> = blocks
+            .iter()
+            .map(|b| match b {
+                UserBlock::Text(t) => ContentBlockOut::Text { text: t.clone() },
+                UserBlock::Pdf(bytes) => ContentBlockOut::Document {
+                    source: DocumentSource {
+                        kind: "base64",
+                        media_type: "application/pdf",
+                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    },
+                },
+            })
+            .collect();
+
         let req = MessagesRequest {
             model: &self.model,
             max_tokens,
             system: Some(system),
-            messages: vec![Message {
+            messages: vec![BlockMessage {
                 role: "user",
-                content: user,
+                content,
             }],
         };
 
@@ -91,6 +119,18 @@ impl Client {
     pub fn model(&self) -> &str {
         &self.model
     }
+
+    /// Override the model id (e.g. from a `--model` CLI flag).
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+}
+
+/// One piece of a user message. `Text` for prose, `Pdf` for a PDF attachment
+/// the model should read as a `document` content block.
+pub enum UserBlock {
+    Text(String),
+    Pdf(Vec<u8>),
 }
 
 #[derive(Serialize)]
@@ -99,13 +139,28 @@ struct MessagesRequest<'a> {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
-    messages: Vec<Message<'a>>,
+    messages: Vec<BlockMessage<'a>>,
 }
 
 #[derive(Serialize)]
-struct Message<'a> {
+struct BlockMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: Vec<ContentBlockOut>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentBlockOut {
+    Text { text: String },
+    Document { source: DocumentSource },
+}
+
+#[derive(Serialize)]
+struct DocumentSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: &'static str,
+    data: String,
 }
 
 #[derive(Deserialize)]
