@@ -23,11 +23,17 @@ pub struct CsvArgs {
     #[arg(long, conflicts_with = "infer")]
     pub profile: Option<String>,
 
-    /// (Not yet implemented) Hand the first lines of the file to an LLM and
-    /// generate a profile TOML. The generated profile is saved next to your
-    /// other profiles and used for the run.
+    /// Hand the first lines of the file to Anthropic and generate a profile
+    /// TOML. The result is saved to `~/.config/fetchdoc/profiles/<name>.toml`
+    /// (see `--name`) and used to parse the file. Per-row data is never sent.
     #[arg(long, default_value_t = false)]
     pub infer: bool,
+
+    /// Profile name to save under when using `--infer`. Defaults to the input
+    /// file's stem (e.g. `statement.csv` → `statement`). Ignored without
+    /// `--infer`.
+    #[arg(long, requires = "infer")]
+    pub name: Option<String>,
 
     /// Suppress per-row stderr progress.
     #[arg(long, default_value_t = false)]
@@ -46,15 +52,26 @@ pub async fn run(args: CsvArgs) -> anyhow::Result<()> {
         .with_context(|| format!("loading profile {profile_value}"))?;
 
     let bytes = read_input_bytes(&args.input)?;
-    let text = decode(&bytes, &profile.encoding)
-        .with_context(|| format!("decoding input as {}", profile.encoding))?;
+    run_with_bytes(&bytes, &profile, &args.input, args.quiet)
+}
 
-    parse_into_jsonl(&text, &profile, &args.input, args.quiet)
+/// Decode `bytes` per `profile` and emit Transaction JSONL on stdout.
+/// Shared by the deterministic path and `--infer` (which has already loaded
+/// the bytes for sniffing — re-using them avoids a second disk read).
+pub(super) fn run_with_bytes(
+    bytes: &[u8],
+    profile: &Profile,
+    source_label: &str,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let text = decode(bytes, &profile.encoding)
+        .with_context(|| format!("decoding input as {}", profile.encoding))?;
+    parse_into_jsonl(&text, profile, source_label, quiet)
 }
 
 /// Read the whole file (or stdin) into memory. Bank statements are tiny
 /// (kilobytes to a few MB) so streaming isn't worth the complexity.
-fn read_input_bytes(input: &str) -> anyhow::Result<Vec<u8>> {
+pub(super) fn read_input_bytes(input: &str) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     if input == "-" {
         let mut buf = Vec::new();
@@ -66,7 +83,7 @@ fn read_input_bytes(input: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Decode raw bytes using a label like `"shift_jis"` / `"utf-8"`.
-fn decode(bytes: &[u8], label: &str) -> anyhow::Result<String> {
+pub(super) fn decode(bytes: &[u8], label: &str) -> anyhow::Result<String> {
     let enc = encoding_rs::Encoding::for_label(label.as_bytes())
         .ok_or_else(|| anyhow::anyhow!("unknown encoding label {label:?}"))?;
     let (cow, _, had_errors) = enc.decode(bytes);
