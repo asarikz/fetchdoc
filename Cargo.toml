@@ -32,6 +32,8 @@ calamine = { version = "0.30", features = ["dates"] }
 base64 = "0.22"
 rand = "0.8"
 sha2 = "0.10"
+mailparse = "0.15"
+walkdir = "2"
 
 [dev-dependencies]
 assert_cmd = "2"
