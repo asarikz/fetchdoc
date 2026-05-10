@@ -1,0 +1,15 @@
+use clap::Parser;
+
+mod auth;
+mod classify;
+mod cli;
+mod export;
+mod invoicing_jp;
+mod io;
+mod sources;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = cli::Cli::parse();
+    cli.run().await
+}
