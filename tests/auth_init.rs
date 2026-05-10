@@ -9,7 +9,7 @@ use assert_cmd::Command;
 
 #[test]
 fn init_with_from_copies_desktop_client_secret() {
-    let tmp = tempdir();
+    let tmp = tempdir("desktop");
     let src = tmp.join("downloaded.json");
     std::fs::write(
         &src,
@@ -40,7 +40,7 @@ fn init_with_from_copies_desktop_client_secret() {
 
 #[test]
 fn init_rejects_web_client_secret_without_writing() {
-    let tmp = tempdir();
+    let tmp = tempdir("web");
     let src = tmp.join("web.json");
     std::fs::write(&src, r#"{"web":{"client_id":"abc","client_secret":"shh"}}"#).unwrap();
 
@@ -59,7 +59,7 @@ fn init_rejects_web_client_secret_without_writing() {
 
 #[test]
 fn init_without_from_prints_setup_instructions() {
-    let tmp = tempdir();
+    let tmp = tempdir("setup");
     let out = Command::cargo_bin("fetchdoc")
         .unwrap()
         .env("XDG_CONFIG_HOME", &tmp)
@@ -79,7 +79,7 @@ fn init_without_from_prints_setup_instructions() {
 
 #[test]
 fn login_without_client_secret_errors_clearly() {
-    let tmp = tempdir();
+    let tmp = tempdir("login");
     let out = Command::cargo_bin("fetchdoc")
         .unwrap()
         .env("XDG_CONFIG_HOME", &tmp)
@@ -91,13 +91,17 @@ fn login_without_client_secret_errors_clearly() {
     assert!(err.contains("auth init"), "got: {err}");
 }
 
-fn tempdir() -> std::path::PathBuf {
+/// Per-test unique tempdir. The `tag` prefix defends against nanosecond
+/// clock collisions when these tests run in parallel — without it, two
+/// tests can land in the same path and clobber each other's
+/// `XDG_CONFIG_HOME`, which then makes one fail intermittently in CI.
+fn tempdir(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    p.push(format!("fetchdoc-auth-{nanos}"));
+    p.push(format!("fetchdoc-auth-{tag}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

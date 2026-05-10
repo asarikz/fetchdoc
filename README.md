@@ -56,19 +56,51 @@ GitHub Release once the v0.1 milestone closes.
 ## Local mail import (no OAuth)
 
 If you'd rather not — or can't — set up a Google Cloud OAuth client, point
-fetchdoc at a folder of `.eml` files instead. Apple Mail, Thunderbird,
-Outlook, Google Takeout, and `offlineimap` / `mbsync` can all produce these.
+fetchdoc at local mail files instead. Apple Mail, Thunderbird, Outlook,
+Google Takeout, and `offlineimap` / `mbsync` can all produce these.
 
 ```sh
-# Drop a few .eml files into ~/mail-export/ first.
+# A folder of individual .eml files (Thunderbird "Save As", drag-out from Mail).
 fetchdoc fetch eml --dir ~/mail-export --since 2026-04-01 > raw.jsonl
+
+# Or an mbox archive — Apple Mail's "Save Mailbox", Thunderbird's per-folder
+# files, Google Takeout's `All mail.mbox`, mbsync mboxrd output.
+fetchdoc fetch mbox --file ~/Takeout/Mail/All\ mail.mbox --since 2026-04-01 > raw.jsonl
+fetchdoc fetch mbox --dir  ~/Library/Mail/V10                                > raw.jsonl
+
+# Or a Maildir / Maildir++ tree — offlineimap, mbsync default layout, mu/notmuch.
+fetchdoc fetch maildir --dir ~/Maildir --since 2026-04-01 > raw.jsonl
+
 ANTHROPIC_API_KEY=sk-ant-... fetchdoc classify < raw.jsonl > classified.jsonl
 fetchdoc export local --root ~/受領請求書 < classified.jsonl
 ```
 
-`fetch eml` recurses into subdirectories, extracts every PDF attachment into
-a cache directory, and emits the same Document JSONL that `fetch gmail`
-will produce — so the rest of the pipeline is identical.
+All three subcommands extract every PDF attachment into a cache directory
+and emit the same Document JSONL that `fetch gmail` will produce — so the
+rest of the pipeline is identical.
+
+### Receipts that arrive as the email body itself
+
+Some receipts (Stripe / AWS / many SaaS billing notices) ship the invoice
+*as the email body* with no PDF attached. For those, the `fetch` sources
+emit a **body-primary** record (no `attachment_path`, but
+`source_meta.body_is_primary == true` plus an `eml_path` pointing at the
+underlying `.eml`). Run `fetchdoc render-body` between fetch and classify
+to render those bodies to PDF for 電帳法 archival:
+
+```sh
+fetchdoc fetch eml --dir ~/mail-export \
+  | fetchdoc render-body \
+  | fetchdoc classify \
+  | fetchdoc export local --root ~/受領請求書
+```
+
+`render-body` shells out to whichever HTML→PDF tool is on your `$PATH` —
+checked in order: chromium / google-chrome (recommended), `weasyprint`,
+`wkhtmltopdf` (deprecated, used only as a last resort). Pass
+`--renderer chromium|weasyprint|wkhtmltopdf` to pin a specific one.
+Records that already have an `attachment_path` are passed through
+untouched, so it's safe to keep `render-body` in every pipeline.
 
 ## Setting up Gmail access
 
@@ -139,6 +171,9 @@ fetchdoc export gnucash \
 | `auth init / login / status / logout` | — | OS keychain |
 | `fetch gmail` | — | JSONL of `Document` records |
 | `fetch eml --dir PATH` | — | JSONL of `Document` records (no OAuth) |
+| `fetch mbox --file PATH` / `--dir PATH` | — | JSONL of `Document` records (no OAuth) |
+| `fetch maildir --dir PATH` | — | JSONL of `Document` records (no OAuth) |
+| `render-body [--renderer auto\|chromium\|weasyprint\|wkhtmltopdf]` | JSONL | JSONL with rendered-PDF `attachment_path` for body-primary records |
 | `classify [--ocr=anthropic\|vertex\|openai]` | JSONL | JSONL with `extracted` field |
 | `export local --root PATH` | JSONL | files + JSONL with `exported` field |
 | `export gnucash --out CSV` | JSONL | CSV file + JSONL |

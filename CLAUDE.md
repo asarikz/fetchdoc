@@ -64,6 +64,14 @@
 
 実装は `src/io.rs::Document` / `Extracted`。フィールドは累積的（fetch → classify → export で足されていく）。
 
+**body-primary レコード**: PDF 添付がない受信メール（Stripe / SaaS の HTML 領収メール等）では `attachment_path` を空にし、`source_meta` に以下を入れる：
+- `body_is_primary: true`
+- `body_part_index: <usize>`（DFS preorder index、`render-body` が `.eml` を再パースして同じパートを取り出す）
+- `body_mime_type: "text/html" | "text/plain"`
+- `eml_path: <path>`（eml/maildir はユーザのファイルを直接、mbox/gmail は cache に materialise した `.eml`）
+
+`fetchdoc render-body` がこれを読み、HTML 化して chromium / weasyprint / wkhtmltopdf のどれかで PDF を生成、`attachment_path` を埋めて pass-through。すでに `attachment_path` がある通常レコードは触らない。
+
 ### exit code
 
 | code | 意味 |
