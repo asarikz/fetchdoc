@@ -1,0 +1,22 @@
+# Example profile: GMO あおぞらネット銀行 入出金明細 CSV.
+#
+# Save to ~/.config/fetchdoc/profiles/gmo_aozora.toml and use:
+#
+#   fetchdoc import csv --profile gmo_aozora statement-102-1-XXXXXXX.csv > tx.jsonl
+#
+# Column names match the "入出金明細CSVダウンロード" output as of 2026.
+# 日付列は区切り文字なしの YYYYMMDD (例: 20260501) なので date_format は %Y%m%d。
+
+name = "gmo_aozora"
+encoding = "shift_jis"
+delimiter = ","
+header_row = 1
+date_format = "%Y%m%d"
+
+[columns]
+posted_date = "日付"
+description = "摘要"
+deposit     = "入金金額"
+withdrawal  = "出金金額"
+balance     = "残高"
+memo        = "メモ"
