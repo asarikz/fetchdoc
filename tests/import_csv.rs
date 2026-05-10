@@ -116,6 +116,65 @@ balance     = "差引残高"
 }
 
 #[test]
+fn halfwidth_katakana_is_normalised_into_description_normalized() {
+    // Many Japanese banks emit half-width katakana in their CSV exports.
+    // The importer should preserve the source bytes in description_raw and
+    // populate description_normalized with the full-width form so downstream
+    // tools (and humans) get readable text.
+    let tmp = tempdir();
+    // Different filenames from `smbc_csv_to_gnucash_pipeline` so that if the
+    // nanosecond-based `tempdir()` collides under parallel test execution the
+    // two tests don't clobber each other's inputs.
+    let profile_path = tmp.join("smbc-halfwidth.toml");
+    std::fs::write(
+        &profile_path,
+        r#"
+name = "smbc"
+encoding = "shift_jis"
+date_format = "%Y/%m/%d"
+
+[columns]
+posted_date = "年月日"
+description = "お取り扱い内容"
+withdrawal  = "お支払金額"
+deposit     = "お預り金額"
+"#,
+    )
+    .unwrap();
+
+    let csv_path = tmp.join("statement-halfwidth.csv");
+    // ｱｸﾒｶﾌﾞｼｷｶﾞｲｼｬ (half-width katakana with voiced marks)
+    write_sjis(
+        &csv_path,
+        "年月日,お取り扱い内容,お支払金額,お預り金額\n\
+         2026/04/30,ｱｸﾒｶﾌﾞｼｷｶﾞｲｼｬ,12100,\n",
+    );
+
+    let out = Command::cargo_bin("fetchdoc")
+        .unwrap()
+        .args([
+            "import",
+            "csv",
+            "--profile",
+            profile_path.to_str().unwrap(),
+            "--quiet",
+            csv_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run import csv");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let line = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(v["description_raw"], "ｱｸﾒｶﾌﾞｼｷｶﾞｲｼｬ");
+    assert_eq!(v["description_normalized"], "アクメカブシキガイシャ");
+}
+
+#[test]
 fn missing_profile_errors() {
     let out = Command::cargo_bin("fetchdoc")
         .unwrap()

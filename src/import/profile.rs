@@ -50,6 +50,35 @@ pub struct Profile {
     /// `splits` filled in for matched debit rows.
     #[serde(default)]
     pub multi: Option<MultiConfig>,
+
+    /// Per-profile text-normalisation switches. Result is written to
+    /// [`Transaction::description_normalized`](crate::io::Transaction);
+    /// `description_raw` is never modified.
+    #[serde(default)]
+    pub normalize: NormalizeConfig,
+}
+
+/// Text-normalisation switches. Defaults are all on — Japanese bank CSVs
+/// almost always benefit from them, and downstream consumers can fall back
+/// to `description_raw` if they need the source bytes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NormalizeConfig {
+    /// Convert half-width katakana to full-width (e.g. `ｱｸﾒ` → `アクメ`).
+    /// Folds spacing voiced/semi-voiced marks (`ｶﾞ`→`ガ`, `ﾊﾟ`→`パ`).
+    #[serde(default = "default_true")]
+    pub halfwidth_kana: bool,
+}
+
+impl Default for NormalizeConfig {
+    fn default() -> Self {
+        Self {
+            halfwidth_kana: default_true(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

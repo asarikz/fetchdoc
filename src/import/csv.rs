@@ -5,6 +5,7 @@
 //! TOML is saved so subsequent runs are decode-only.
 
 use crate::import::Profile;
+use crate::import::normalize::halfwidth_kana_to_fullwidth;
 use crate::io::{Transaction, write_jsonl_stdout};
 use anyhow::Context;
 use chrono::NaiveDate;
@@ -295,6 +296,13 @@ fn build_transaction(
 
     let external_id = make_external_id(&profile.name, &posted_date, amount_jpy, &description_raw);
 
+    let description_normalized = if profile.normalize.halfwidth_kana {
+        let n = halfwidth_kana_to_fullwidth(&description_raw);
+        (n != description_raw).then_some(n)
+    } else {
+        None
+    };
+
     let status = if amount_jpy == 0 {
         "needs_review"
     } else {
@@ -311,7 +319,7 @@ fn build_transaction(
         amount_jpy,
         balance_jpy,
         description_raw,
-        description_normalized: None,
+        description_normalized,
         counterparty_guess: None,
         memo,
         category_guess: None,
