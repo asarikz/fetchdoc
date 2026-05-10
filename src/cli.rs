@@ -21,6 +21,8 @@ pub enum Command {
     Auth(crate::auth::AuthArgs),
     /// Fetch documents from a source. Emits JSONL on stdout.
     Fetch(crate::sources::FetchArgs),
+    /// Import bank/card statements from a local file. Emits Transaction JSONL.
+    Import(crate::import::ImportArgs),
     /// Classify and extract structured data from documents on stdin.
     Classify(crate::classify::ClassifyArgs),
     /// Export classified documents (read JSONL on stdin).
@@ -37,6 +39,7 @@ impl Cli {
         match self.command {
             Command::Auth(args) => crate::auth::run(args).await,
             Command::Fetch(args) => crate::sources::run(args).await,
+            Command::Import(args) => crate::import::run(args).await,
             Command::Classify(args) => crate::classify::run(args).await,
             Command::Export(args) => crate::export::run(args).await,
             Command::VerifyTnumber { tnumber } => {
