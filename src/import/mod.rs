@@ -15,6 +15,7 @@ pub(crate) mod csv;
 mod dedup;
 mod infer;
 mod multi;
+mod normalize;
 mod profile;
 mod xlsx;
 

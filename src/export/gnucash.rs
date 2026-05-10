@@ -199,6 +199,7 @@ fn write_transaction_row<W: Write>(
     let description = tx
         .counterparty_guess
         .clone()
+        .or_else(|| tx.description_normalized.clone())
         .unwrap_or_else(|| tx.description_raw.clone());
 
     // No explicit splits → emit the legacy single-row form so GnuCash's

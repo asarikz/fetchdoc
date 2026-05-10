@@ -90,7 +90,8 @@ pub struct Transaction {
     pub balance_jpy: Option<i64>,
     /// Description as it appears in the source, before any normalisation.
     pub description_raw: String,
-    /// Cleaned-up description (full-width → half-width, trimmed, etc.).
+    /// Cleaned-up description (half-width katakana → full-width, etc.).
+    /// `None` when normalisation produced no change or was disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description_normalized: Option<String>,
     /// Counterparty guess from `classify`.
