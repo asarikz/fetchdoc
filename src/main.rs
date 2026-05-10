@@ -4,6 +4,7 @@ mod auth;
 mod classify;
 mod cli;
 mod export;
+mod import;
 mod invoicing_jp;
 mod io;
 mod sources;

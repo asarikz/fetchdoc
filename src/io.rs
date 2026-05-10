@@ -3,18 +3,21 @@
 //! Shared JSON Lines I/O helpers.
 //!
 //! Every subcommand follows the same convention:
-//! - **stdin**: one JSON object per line (`Document`)
-//! - **stdout**: one JSON object per line (`Document` with additional fields)
+//! - **stdin**: one JSON object per line
+//! - **stdout**: one JSON object per line (often the same record with extra fields)
 //! - **stderr**: human-readable progress (suppressed by `--quiet`)
 //!
-//! Records flow through the pipeline accumulating fields. `fetch` produces
-//! the initial record; `classify` adds `extracted`; `export` adds `exported`.
+//! Two record shapes flow through the pipeline:
+//! - [`Document`] — invoice/receipt PDFs (Gmail → classify → export)
+//! - [`Transaction`] — bank/card line items (CSV/xlsx import → classify → export)
+//!
+//! Records accumulate fields as they pass through subcommands.
 
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
-/// One row of the fetchdoc pipeline. Fields accumulate as the document
+/// One row of the fetchdoc invoice pipeline. Fields accumulate as the document
 /// passes through subcommands.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Document {
     /// Upstream system (`"gmail"`, `"outlook"`, `"local"`).
     pub source: String,
@@ -33,21 +36,15 @@ pub struct Document {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exported: Option<serde_json::Value>,
     /// `"ok"` (default) or `"needs_review"` — set by `classify` when validation fails.
-    #[serde(default = "Document::default_status")]
+    #[serde(default = "default_status")]
     pub status: String,
-}
-
-impl Document {
-    fn default_status() -> String {
-        "ok".to_string()
-    }
 }
 
 /// Structured fields extracted from the document by `classify`.
 ///
 /// Mirrors Japanese qualified-invoice (適格請求書) requirements:
 /// transaction date, total amount, counterparty name, optional T number.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Extracted {
     /// ISO date string (`YYYY-MM-DD`) of the transaction.
     pub transaction_date: String,
@@ -62,9 +59,67 @@ pub struct Extracted {
     pub confidence: f64,
 }
 
-/// Read JSONL one line at a time from a buffered reader, deserialising each
-/// line into a `Document`. Empty lines are skipped.
-pub fn read_jsonl_stdin() -> impl Iterator<Item = anyhow::Result<Document>> {
+/// One row of the bank/card transaction pipeline. Produced by `import csv`
+/// and `import xlsx`; consumed by `classify` (counterparty/category guesses)
+/// and `export gnucash`.
+///
+/// Sign convention: `amount_jpy` is **signed** — outflows (withdrawals) are
+/// negative, inflows (deposits) positive. This matches GnuCash's transfer
+/// semantics and lets a single field replace the typical Japanese-bank
+/// `withdrawal` / `deposit` column pair.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Transaction {
+    /// Upstream type — `"csv"`, `"xlsx"`, etc.
+    pub source: String,
+    /// Profile name used to parse the source, e.g. `"smbc"`. `None` if the
+    /// caller declined a profile (raw passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_profile: Option<String>,
+    /// Stable id derived from profile + date + amount + description. Used for
+    /// deduplication on re-import.
+    pub external_id: String,
+    /// Posted/booking date (`YYYY-MM-DD`).
+    pub posted_date: String,
+    /// Value date if the source distinguishes it from posted date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_date: Option<String>,
+    /// Signed amount in JPY. Outflows negative, inflows positive.
+    pub amount_jpy: i64,
+    /// Running balance after this transaction, if the source provides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_jpy: Option<i64>,
+    /// Description as it appears in the source, before any normalisation.
+    pub description_raw: String,
+    /// Cleaned-up description (full-width → half-width, trimmed, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_normalized: Option<String>,
+    /// Counterparty guess from `classify`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterparty_guess: Option<String>,
+    /// Free-form memo column from the source, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    /// GnuCash-style account suggestion from `classify` (e.g. `Expenses:Food`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_guess: Option<String>,
+    /// Anything else the importer wants to keep around (raw row, file path, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_meta: Option<serde_json::Value>,
+    /// Result of a successful export step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exported: Option<serde_json::Value>,
+    /// `"ok"` (default) or `"needs_review"`.
+    #[serde(default = "default_status")]
+    pub status: String,
+}
+
+fn default_status() -> String {
+    "ok".to_string()
+}
+
+/// Read JSONL one line at a time from stdin, deserialising each line as `T`.
+/// Empty lines are skipped.
+pub fn read_jsonl_stdin<T: DeserializeOwned>() -> impl Iterator<Item = anyhow::Result<T>> {
     use std::io::BufRead;
     let stdin = std::io::stdin();
     let lock = stdin.lock();
@@ -77,11 +132,11 @@ pub fn read_jsonl_stdin() -> impl Iterator<Item = anyhow::Result<Document>> {
 
 /// Write a single record as one JSONL line to stdout, flushing immediately so
 /// downstream commands in a pipe see records as they're produced.
-pub fn write_jsonl_stdout(doc: &Document) -> anyhow::Result<()> {
+pub fn write_jsonl_stdout<T: Serialize>(record: &T) -> anyhow::Result<()> {
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    serde_json::to_writer(&mut lock, doc)?;
+    serde_json::to_writer(&mut lock, record)?;
     lock.write_all(b"\n")?;
     lock.flush()?;
     Ok(())

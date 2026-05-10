@@ -1,0 +1,22 @@
+# Example profile: SMBC (三井住友銀行) personal account CSV export.
+#
+# Save to ~/.config/fetchdoc/profiles/smbc.toml and use:
+#
+#   fetchdoc import csv --profile smbc statement.csv > tx.jsonl
+#
+# Column names match SMBC's "ご利用明細データ (CSV)" download as of 2026.
+# Tweak if your bank's export differs — `import csv --infer` (planned) will
+# generate this file for you automatically.
+
+name = "smbc"
+encoding = "shift_jis"
+delimiter = ","
+header_row = 1
+date_format = "%Y/%m/%d"
+
+[columns]
+posted_date = "年月日"
+description = "お取り扱い内容"
+withdrawal  = "お支払金額"
+deposit     = "お預り金額"
+balance     = "差引残高"
