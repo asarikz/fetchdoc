@@ -6,6 +6,7 @@
 
 use clap::{Args, Subcommand};
 
+mod dir;
 mod eml;
 mod gmail;
 mod maildir;
@@ -32,6 +33,9 @@ enum FetchCommand {
     Mbox(mbox::MboxArgs),
     /// Pull PDF attachments out of locally-stored Maildir trees.
     Maildir(maildir::MaildirArgs),
+    /// Ingest pre-downloaded PDFs from a local folder (Amazon / ヨドバシ /
+    /// NUROモバイル の領収書 etc. that the user saved by hand).
+    Dir(dir::DirArgs),
 }
 
 pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
@@ -40,5 +44,6 @@ pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
         FetchCommand::Eml(a) => eml::run(a).await,
         FetchCommand::Mbox(a) => mbox::run(a).await,
         FetchCommand::Maildir(a) => maildir::run(a).await,
+        FetchCommand::Dir(a) => dir::run(a).await,
     }
 }
