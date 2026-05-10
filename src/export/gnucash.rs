@@ -22,10 +22,11 @@
 //! `exported.gnucash = ...` so further export targets can chain.
 
 use crate::export::accounts::{Chart, Pick, pick_debit_account};
-use crate::io::{Document, Split, Transaction, write_jsonl_stdout};
+use crate::io::{Document, DocumentType, Split, Transaction, write_jsonl_stdout};
 use anyhow::Context;
 use clap::Args;
 use serde_json::json;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -70,6 +71,14 @@ pub struct GnucashArgs {
     #[arg(long, default_value = "JPY")]
     pub currency: String,
 
+    /// **Document input only.** Disable invoice/receipt deduplication. By
+    /// default, Documents that share `(transaction_date, total_amount_jpy,
+    /// counterparty_name)` are collapsed to one CSV row to avoid double-
+    /// counting Amazon-style invoice + receipt pairs (the receipt — 領収書 —
+    /// is preferred). Pass this flag to write a row per Document instead.
+    #[arg(long, default_value_t = false)]
+    pub keep_duplicates: bool,
+
     /// Suppress per-row stderr progress.
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
@@ -107,6 +116,14 @@ pub async fn run(args: GnucashArgs) -> anyhow::Result<()> {
 
     let mut written = 0usize;
     let mut skipped = 0usize;
+    let mut suppressed = 0usize;
+
+    // Documents are buffered so we can dedup invoice/receipt pairs across the
+    // whole input batch (one transaction must produce only one GnuCash row).
+    // Transactions still stream so the bank-statement pipeline keeps its
+    // line-at-a-time behaviour — no need to dedup a statement against itself.
+    let mut buffered_docs: Vec<Document> = Vec::new();
+
     for line_res in read_jsonl_lines() {
         let line = line_res.context("reading JSONL on stdin")?;
         let value: serde_json::Value =
@@ -127,91 +144,9 @@ pub async fn run(args: GnucashArgs) -> anyhow::Result<()> {
                 written += 1;
             }
             RecordKind::Document => {
-                let mut doc: Document =
+                let doc: Document =
                     serde_json::from_value(value).context("decoding record as Document")?;
-                let Some(extracted) = doc.extracted.clone() else {
-                    doc.status = "needs_review".to_string();
-                    skipped += 1;
-                    if !args.quiet {
-                        eprintln!(
-                            "export gnucash: skipped {} (no extracted fields; run classify first)",
-                            doc.external_id
-                        );
-                    }
-                    write_jsonl_stdout(&doc)?;
-                    continue;
-                };
-                let credit = args.credit_account.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Document record requires --credit-account (the payable / cash side)"
-                    )
-                })?;
-
-                // Decide the debit (expense) account: ask the LLM if --accounts
-                // was given, otherwise use the fixed --debit-account.
-                let (debit, debit_source, picker_note) = match &picker {
-                    Some(ctx) => {
-                        match pick_debit_account(&ctx.client, &ctx.chart, &doc, &extracted).await {
-                            Ok(Pick::Picked(name)) => (name, "picker", None),
-                            Ok(Pick::Fallback { reason }) => {
-                                doc.status = "needs_review".to_string();
-                                let fallback = args.debit_account.clone().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "picker could not choose an account ({reason}) and \
-                                     --debit-account fallback is not set"
-                                    )
-                                })?;
-                                if !args.quiet {
-                                    eprintln!(
-                                        "export gnucash: {} → fallback {fallback} ({reason})",
-                                        doc.external_id
-                                    );
-                                }
-                                (fallback, "fallback", Some(reason))
-                            }
-                            Err(e) => {
-                                // Network / API error — fall back too rather than
-                                // aborting the whole batch, so a flaky call doesn't
-                                // lose CSV rows we already wrote.
-                                doc.status = "needs_review".to_string();
-                                let fallback = args.debit_account.clone().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "picker call failed ({e:#}) and --debit-account fallback \
-                                     is not set"
-                                    )
-                                })?;
-                                let reason = format!("picker error: {e:#}");
-                                if !args.quiet {
-                                    eprintln!(
-                                        "export gnucash: {} → fallback {fallback} ({reason})",
-                                        doc.external_id
-                                    );
-                                }
-                                (fallback, "fallback", Some(reason))
-                            }
-                        }
-                    }
-                    None => {
-                        let d = args.debit_account.clone().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Document record requires --debit-account (the expense side) \
-                                 or --accounts for picker mode"
-                            )
-                        })?;
-                        (d, "fixed", None)
-                    }
-                };
-
-                write_document_row(&mut wtr, &doc, &extracted, &debit, credit, &args)?;
-                doc.exported = Some(merge_exported_doc(
-                    doc.exported.take(),
-                    &args.out,
-                    &debit,
-                    debit_source,
-                    picker_note.as_deref(),
-                ));
-                write_jsonl_stdout(&doc)?;
-                written += 1;
+                buffered_docs.push(doc);
             }
             RecordKind::Unknown => {
                 anyhow::bail!(
@@ -221,20 +156,285 @@ pub async fn run(args: GnucashArgs) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Split buffered documents into "kept" (one row each in CSV) and
+    // "suppressed" (duplicates that get a JSONL passthrough but no CSV row).
+    // Records missing `extracted` always end up "kept" so they keep their
+    // existing needs_review behaviour rather than getting silently dropped.
+    let DedupResult {
+        kept,
+        suppressed: suppressed_docs,
+    } = if args.keep_duplicates {
+        DedupResult {
+            kept: buffered_docs,
+            suppressed: Vec::new(),
+        }
+    } else {
+        dedup_documents(buffered_docs, args.quiet)
+    };
+
+    for mut doc in kept {
+        let Some(extracted) = doc.extracted.clone() else {
+            doc.status = "needs_review".to_string();
+            skipped += 1;
+            if !args.quiet {
+                eprintln!(
+                    "export gnucash: skipped {} (no extracted fields; run classify first)",
+                    doc.external_id
+                );
+            }
+            write_jsonl_stdout(&doc)?;
+            continue;
+        };
+        let credit = args.credit_account.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Document record requires --credit-account (the payable / cash side)")
+        })?;
+
+        // Decide the debit (expense) account: ask the LLM if --accounts
+        // was given, otherwise use the fixed --debit-account.
+        let (debit, debit_source, picker_note) = match &picker {
+            Some(ctx) => {
+                match pick_debit_account(&ctx.client, &ctx.chart, &doc, &extracted).await {
+                    Ok(Pick::Picked(name)) => (name, "picker", None),
+                    Ok(Pick::Fallback { reason }) => {
+                        doc.status = "needs_review".to_string();
+                        let fallback = args.debit_account.clone().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "picker could not choose an account ({reason}) and \
+                                 --debit-account fallback is not set"
+                            )
+                        })?;
+                        if !args.quiet {
+                            eprintln!(
+                                "export gnucash: {} → fallback {fallback} ({reason})",
+                                doc.external_id
+                            );
+                        }
+                        (fallback, "fallback", Some(reason))
+                    }
+                    Err(e) => {
+                        // Network / API error — fall back too rather than
+                        // aborting the whole batch, so a flaky call doesn't
+                        // lose CSV rows we already wrote.
+                        doc.status = "needs_review".to_string();
+                        let fallback = args.debit_account.clone().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "picker call failed ({e:#}) and --debit-account fallback \
+                                 is not set"
+                            )
+                        })?;
+                        let reason = format!("picker error: {e:#}");
+                        if !args.quiet {
+                            eprintln!(
+                                "export gnucash: {} → fallback {fallback} ({reason})",
+                                doc.external_id
+                            );
+                        }
+                        (fallback, "fallback", Some(reason))
+                    }
+                }
+            }
+            None => {
+                let d = args.debit_account.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Document record requires --debit-account (the expense side) \
+                         or --accounts for picker mode"
+                    )
+                })?;
+                (d, "fixed", None)
+            }
+        };
+
+        write_document_row(&mut wtr, &doc, &extracted, &debit, credit, &args)?;
+        doc.exported = Some(merge_exported_doc(
+            doc.exported.take(),
+            &args.out,
+            &debit,
+            debit_source,
+            picker_note.as_deref(),
+        ));
+        write_jsonl_stdout(&doc)?;
+        written += 1;
+    }
+
+    // Suppressed duplicates: pass through with a marker so downstream tools
+    // (or the user's eye on the JSONL log) can see *why* they did not become
+    // a CSV row. status stays "ok" because skipping is intentional, not an
+    // error — using needs_review here would be misleading.
+    for mut doc in suppressed_docs {
+        doc.exported = Some(merge_exported_doc_suppressed(
+            doc.exported.take(),
+            &args.out,
+        ));
+        write_jsonl_stdout(&doc)?;
+        suppressed += 1;
+    }
+
     wtr.flush()?;
 
     if !args.quiet {
-        eprintln!(
-            "export gnucash: wrote {written} rows to {}{}",
-            args.out,
-            if skipped > 0 {
-                format!(" ({skipped} skipped)")
-            } else {
-                String::new()
+        let mut tail = String::new();
+        if skipped > 0 {
+            tail.push_str(&format!(" ({skipped} skipped"));
+            if suppressed > 0 {
+                tail.push_str(&format!(", {suppressed} duplicates suppressed"));
             }
-        );
+            tail.push(')');
+        } else if suppressed > 0 {
+            tail.push_str(&format!(" ({suppressed} duplicates suppressed)"));
+        }
+        eprintln!("export gnucash: wrote {written} rows to {}{tail}", args.out);
     }
     Ok(())
+}
+
+/// Outcome of the invoice/receipt dedup pass.
+struct DedupResult {
+    /// Documents that should each produce a CSV row (one per real-world
+    /// transaction). Missing-`extracted` records pass through here so they
+    /// keep their existing needs_review path.
+    kept: Vec<Document>,
+    /// Duplicate Documents that were collapsed away from the CSV. They still
+    /// flow on stdout so callers can audit them.
+    suppressed: Vec<Document>,
+}
+
+/// Group documents by `(transaction_date, total_amount_jpy, counterparty_name)`
+/// and pick one per group. Preference order within a group:
+/// receipt (領収書) > invoice (請求書) > other > unknown. Ties (same priority)
+/// are broken by `external_id` lexicographic order so the choice is
+/// deterministic across runs.
+///
+/// Documents without `extracted` are never grouped — we have nothing reliable
+/// to compare on, so they pass through unchanged and the existing missing-
+/// `extracted` path downstream marks them needs_review.
+fn dedup_documents(docs: Vec<Document>, quiet: bool) -> DedupResult {
+    // Preserve original input order for the kept-list. We bucket by group
+    // key and remember the index of the first record in each group, so the
+    // final output order matches the order in which each group's first
+    // record appeared in stdin.
+    let mut groups: HashMap<DedupKey, Vec<usize>> = HashMap::new();
+    let mut group_first_idx: HashMap<DedupKey, usize> = HashMap::new();
+    let mut ungrouped: Vec<(usize, Document)> = Vec::new();
+    let mut grouped: Vec<(usize, Document)> = Vec::new();
+
+    for (idx, doc) in docs.into_iter().enumerate() {
+        match dedup_key(&doc) {
+            Some(key) => {
+                group_first_idx.entry(key.clone()).or_insert(idx);
+                groups.entry(key.clone()).or_default().push(grouped.len());
+                grouped.push((idx, doc));
+            }
+            None => ungrouped.push((idx, doc)),
+        }
+    }
+
+    let mut kept_with_idx: Vec<(usize, Document)> = ungrouped;
+    let mut suppressed: Vec<Document> = Vec::new();
+
+    for (key, mut indices) in groups {
+        // Sort the records in this group by preference, ascending: index 0
+        // becomes the kept record.
+        indices.sort_by(|&a, &b| {
+            let da = &grouped[a].1;
+            let db = &grouped[b].1;
+            doc_priority(da)
+                .cmp(&doc_priority(db))
+                .then_with(|| da.external_id.cmp(&db.external_id))
+        });
+        let kept_local = indices[0];
+        let kept_doc = &grouped[kept_local].1;
+        let first_idx = *group_first_idx.get(&key).expect("group has first idx");
+        let kept_external_id = kept_doc.external_id.clone();
+        let kept_type_label = type_label(kept_doc);
+        if indices.len() > 1 && !quiet {
+            let losers: Vec<String> = indices[1..]
+                .iter()
+                .map(|&i| {
+                    format!(
+                        "{} ({})",
+                        grouped[i].1.external_id,
+                        type_label(&grouped[i].1),
+                    )
+                })
+                .collect();
+            eprintln!(
+                "export gnucash: dedup [{} / ¥{} / {}]: kept {} ({}), suppressed {}",
+                key.date,
+                key.amount,
+                key.counterparty,
+                kept_external_id,
+                kept_type_label,
+                losers.join(", "),
+            );
+        }
+        // Push the kept record using the group's first stdin index so the
+        // final order respects the order in which the user fed records in.
+        kept_with_idx.push((first_idx, grouped[kept_local].1.clone()));
+        for &i in &indices[1..] {
+            suppressed.push(grouped[i].1.clone());
+        }
+    }
+
+    kept_with_idx.sort_by_key(|(i, _)| *i);
+    let kept = kept_with_idx.into_iter().map(|(_, d)| d).collect();
+    DedupResult { kept, suppressed }
+}
+
+/// The grouping key used to detect "this is the same transaction described by
+/// two different documents" — the Amazon invoice/receipt case. Counterparty
+/// names that differ between the two will *not* be grouped; that's a
+/// deliberate trade-off (we'd rather leave a duplicate than collapse two
+/// genuinely distinct purchases).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DedupKey {
+    date: String,
+    amount: i64,
+    counterparty: String,
+}
+
+fn dedup_key(doc: &Document) -> Option<DedupKey> {
+    let ex = doc.extracted.as_ref()?;
+    Some(DedupKey {
+        date: ex.transaction_date.clone(),
+        amount: ex.total_amount_jpy,
+        counterparty: ex.counterparty_name.clone(),
+    })
+}
+
+/// Smaller is more preferred. Within a duplicate group we keep the lowest.
+fn doc_priority(doc: &Document) -> u8 {
+    match doc.extracted.as_ref().and_then(|e| e.document_type) {
+        Some(DocumentType::Receipt) => 0,
+        Some(DocumentType::Invoice) => 1,
+        Some(DocumentType::Other) => 2,
+        None => 3,
+    }
+}
+
+fn type_label(doc: &Document) -> &'static str {
+    match doc.extracted.as_ref().and_then(|e| e.document_type) {
+        Some(t) => t.en(),
+        None => "unknown",
+    }
+}
+
+fn merge_exported_doc_suppressed(
+    prev: Option<serde_json::Value>,
+    out_path: &str,
+) -> serde_json::Value {
+    let mut obj = match prev {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert(
+        "gnucash".into(),
+        json!({
+            "out": out_path,
+            "suppressed_as_duplicate": true,
+        }),
+    );
+    serde_json::Value::Object(obj)
 }
 
 /// GnuCash 4.x importer columns. Field names match the labels GnuCash shows
@@ -452,4 +652,97 @@ fn merge_exported_doc(
 struct PickerCtx {
     chart: Chart,
     client: crate::anthropic::Client,
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use crate::io::Extracted;
+
+    fn doc(external_id: &str, dt: Option<DocumentType>, name: &str) -> Document {
+        Document {
+            source: "local".into(),
+            external_id: external_id.into(),
+            attachment_path: Some(format!("/p/{external_id}.pdf")),
+            source_meta: None,
+            extracted: Some(Extracted {
+                transaction_date: "2026-04-30".into(),
+                total_amount_jpy: 1980,
+                counterparty_name: name.into(),
+                counterparty_t_number: None,
+                document_type: dt,
+                confidence: 0.9,
+            }),
+            exported: None,
+            status: "ok".into(),
+        }
+    }
+
+    #[test]
+    fn invoice_and_receipt_collapse_to_receipt() {
+        let res = dedup_documents(
+            vec![
+                doc("inv", Some(DocumentType::Invoice), "Amazon"),
+                doc("rcp", Some(DocumentType::Receipt), "Amazon"),
+            ],
+            true,
+        );
+        assert_eq!(res.kept.len(), 1);
+        assert_eq!(res.kept[0].external_id, "rcp");
+        assert_eq!(res.suppressed.len(), 1);
+        assert_eq!(res.suppressed[0].external_id, "inv");
+    }
+
+    #[test]
+    fn distinct_counterparty_keeps_both() {
+        let res = dedup_documents(
+            vec![
+                doc("a", Some(DocumentType::Receipt), "Amazon"),
+                doc("b", Some(DocumentType::Receipt), "ヨドバシ"),
+            ],
+            true,
+        );
+        assert_eq!(res.kept.len(), 2);
+        assert!(res.suppressed.is_empty());
+    }
+
+    #[test]
+    fn missing_extracted_passes_through_kept() {
+        // No `extracted` → can't dedup, must pass through to the
+        // existing needs_review path.
+        let mut d = doc("no-classify", None, "X");
+        d.extracted = None;
+        let res = dedup_documents(vec![d], true);
+        assert_eq!(res.kept.len(), 1);
+        assert_eq!(res.kept[0].external_id, "no-classify");
+    }
+
+    #[test]
+    fn unknown_type_loses_to_typed() {
+        // Three records: one untyped, one invoice, one receipt → keep receipt.
+        let res = dedup_documents(
+            vec![
+                doc("u", None, "Amazon"),
+                doc("i", Some(DocumentType::Invoice), "Amazon"),
+                doc("r", Some(DocumentType::Receipt), "Amazon"),
+            ],
+            true,
+        );
+        assert_eq!(res.kept.len(), 1);
+        assert_eq!(res.kept[0].external_id, "r");
+        assert_eq!(res.suppressed.len(), 2);
+    }
+
+    #[test]
+    fn ties_break_deterministically_by_external_id() {
+        let res = dedup_documents(
+            vec![
+                doc("zzz", Some(DocumentType::Receipt), "Amazon"),
+                doc("aaa", Some(DocumentType::Receipt), "Amazon"),
+            ],
+            true,
+        );
+        assert_eq!(res.kept.len(), 1);
+        assert_eq!(res.kept[0].external_id, "aaa");
+    }
 }
