@@ -65,13 +65,16 @@ fetchdoc fetch eml --dir ~/mail-export --since 2026-04-01 > raw.jsonl
 fetchdoc fetch mbox --file ~/Takeout/Mail/All\ mail.mbox --since 2026-04-01 > raw.jsonl
 fetchdoc fetch mbox --dir  ~/Library/Mail/V10                                > raw.jsonl
 
+# Or a Maildir / Maildir++ tree — offlineimap, mbsync default layout, mu/notmuch.
+fetchdoc fetch maildir --dir ~/Maildir --since 2026-04-01 > raw.jsonl
+
 ANTHROPIC_API_KEY=sk-ant-... fetchdoc classify < raw.jsonl > classified.jsonl
 fetchdoc export local --root ~/受領請求書 < classified.jsonl
 ```
 
-Both subcommands extract every PDF attachment into a cache directory and
-emit the same Document JSONL that `fetch gmail` will produce — so the rest
-of the pipeline is identical.
+All three subcommands extract every PDF attachment into a cache directory
+and emit the same Document JSONL that `fetch gmail` will produce — so the
+rest of the pipeline is identical.
 
 ## Quick start
 
@@ -105,6 +108,7 @@ fetchdoc export gnucash \
 | `fetch gmail` | — | JSONL of `Document` records |
 | `fetch eml --dir PATH` | — | JSONL of `Document` records (no OAuth) |
 | `fetch mbox --file PATH` / `--dir PATH` | — | JSONL of `Document` records (no OAuth) |
+| `fetch maildir --dir PATH` | — | JSONL of `Document` records (no OAuth) |
 | `classify [--ocr=anthropic\|vertex\|openai]` | JSONL | JSONL with `extracted` field |
 | `export local --root PATH` | JSONL | files + JSONL with `exported` field |
 | `export gnucash --out CSV` | JSONL | CSV file + JSONL |

@@ -9,6 +9,7 @@ use clap::{Args, Subcommand};
 mod eml;
 mod gmail;
 mod mail;
+mod maildir;
 mod mbox;
 
 #[derive(Args, Debug)]
@@ -25,6 +26,8 @@ enum FetchCommand {
     Eml(eml::EmlArgs),
     /// Pull PDF attachments out of locally-stored mbox archives.
     Mbox(mbox::MboxArgs),
+    /// Pull PDF attachments out of locally-stored Maildir trees.
+    Maildir(maildir::MaildirArgs),
 }
 
 pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
@@ -32,5 +35,6 @@ pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
         FetchCommand::Gmail(a) => gmail::run(a).await,
         FetchCommand::Eml(a) => eml::run(a).await,
         FetchCommand::Mbox(a) => mbox::run(a).await,
+        FetchCommand::Maildir(a) => maildir::run(a).await,
     }
 }
