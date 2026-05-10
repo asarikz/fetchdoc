@@ -15,6 +15,7 @@
 
 use super::Profile;
 use super::csv::CsvArgs;
+use super::xlsx::XlsxArgs;
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
@@ -34,7 +35,34 @@ pub async fn run_csv(args: &CsvArgs) -> anyhow::Result<()> {
     let (head_text, sniffed_encoding) = sniff_head(&bytes);
     let name = profile_name(args.name.as_deref(), &args.input)?;
 
-    let save_path = save_path_for(&name)?;
+    let profile = run_inference(&name, sniffed_encoding, &head_text, args.quiet).await?;
+
+    super::csv::run_with_bytes(&bytes, &profile, &args.input, args.quiet)
+}
+
+pub async fn run_xlsx(args: &XlsxArgs) -> anyhow::Result<()> {
+    let name = profile_name(args.name.as_deref(), &args.input)?;
+    // Open the workbook just to peek at the head; the deterministic pass
+    // re-opens it. Re-open is cheap (calamine streams from disk) and avoids
+    // threading the workbook through two unrelated codepaths.
+    let head_text = super::xlsx::head_as_csv(&args.input, args.sheet.as_deref(), HEAD_LINES)?;
+
+    // xlsx is binary — encoding is meaningless to the model. Tell it utf-8
+    // so the saved profile parses; the xlsx importer ignores `encoding`.
+    let profile = run_inference(&name, "utf-8", &head_text, args.quiet).await?;
+
+    super::xlsx::run_with_profile(&args.input, args.sheet.as_deref(), &profile, args.quiet)
+}
+
+/// Build the prompt, call Anthropic, validate, and save. Shared by csv / xlsx.
+/// Returns the validated [`Profile`] ready to feed the deterministic parser.
+async fn run_inference(
+    name: &str,
+    sniffed_encoding: &str,
+    head_text: &str,
+    quiet: bool,
+) -> anyhow::Result<Profile> {
+    let save_path = save_path_for(name)?;
     if save_path.exists() {
         anyhow::bail!(
             "profile {} already exists at {}. Pass `--name <other>` or delete the existing file.",
@@ -43,15 +71,15 @@ pub async fn run_csv(args: &CsvArgs) -> anyhow::Result<()> {
         );
     }
 
-    if !args.quiet {
+    if !quiet {
         eprintln!(
-            "infer: sniffed encoding = {sniffed_encoding}, head = {} lines, asking Anthropic…",
+            "infer: encoding hint = {sniffed_encoding}, head = {} lines, asking Anthropic…",
             head_text.lines().count()
         );
     }
 
     let client = crate::anthropic::Client::from_env()?;
-    let user_prompt = build_user_prompt(&name, sniffed_encoding, &head_text);
+    let user_prompt = build_user_prompt(name, sniffed_encoding, head_text);
     let raw = client
         .complete(SYSTEM_PROMPT, &user_prompt, MAX_TOKENS)
         .await
@@ -62,15 +90,14 @@ pub async fn run_csv(args: &CsvArgs) -> anyhow::Result<()> {
         .with_context(|| format!("validating inferred profile:\n{toml_text}"))?;
 
     write_profile(&save_path, toml_text)?;
-    if !args.quiet {
+    if !quiet {
         eprintln!(
             "infer: wrote profile to {} (model {})",
             save_path.display(),
             client.model()
         );
     }
-
-    super::csv::run_with_bytes(&bytes, &profile, &args.input, args.quiet)
+    Ok(profile)
 }
 
 /// System message: tell the model exactly which TOML schema to emit. Keeping

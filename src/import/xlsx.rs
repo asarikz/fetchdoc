@@ -18,9 +18,20 @@ pub struct XlsxArgs {
     pub input: String,
 
     /// Profile name (in `~/.config/fetchdoc/profiles/`) or path to a `.toml`.
-    /// `--infer` is not yet wired for xlsx.
-    #[arg(long)]
-    pub profile: String,
+    #[arg(long, conflicts_with = "infer")]
+    pub profile: Option<String>,
+
+    /// Hand the first ~50 rows of the chosen sheet to Anthropic and generate
+    /// a profile TOML. The result is saved to
+    /// `~/.config/fetchdoc/profiles/<name>.toml` (see `--name`) and used to
+    /// parse the workbook. Per-row data is never sent on subsequent runs.
+    #[arg(long, default_value_t = false)]
+    pub infer: bool,
+
+    /// Profile name to save under when using `--infer`. Defaults to the input
+    /// file's stem. Ignored without `--infer`.
+    #[arg(long, requires = "infer")]
+    pub name: Option<String>,
 
     /// Sheet to import: either a name (e.g. `"明細"`) or a 0-indexed number
     /// as a string (e.g. `"0"`). Defaults to the first sheet.
@@ -33,13 +44,29 @@ pub struct XlsxArgs {
 }
 
 pub async fn run(args: XlsxArgs) -> anyhow::Result<()> {
-    let profile = Profile::resolve(&args.profile)
-        .with_context(|| format!("loading profile {}", args.profile))?;
+    if args.infer {
+        return super::infer::run_xlsx(&args).await;
+    }
+    let profile_value = args
+        .profile
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--profile is required (or use --infer)"))?;
+    let profile = Profile::resolve(profile_value)
+        .with_context(|| format!("loading profile {profile_value}"))?;
 
-    let mut wb: Xlsx<_> =
-        open_workbook(&args.input).with_context(|| format!("opening {}", args.input))?;
+    run_with_profile(&args.input, args.sheet.as_deref(), &profile, args.quiet)
+}
 
-    let range = pick_sheet(&mut wb, args.sheet.as_deref())?;
+/// Open the workbook, pick a sheet, and emit Transaction JSONL using `profile`.
+/// Shared by the deterministic path and `--infer`.
+pub(super) fn run_with_profile(
+    input: &str,
+    sheet: Option<&str>,
+    profile: &Profile,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let mut wb: Xlsx<_> = open_workbook(input).with_context(|| format!("opening {input}"))?;
+    let range = pick_sheet(&mut wb, sheet)?;
 
     // Convert all rows up-front — xlsx files are small, and calamine's
     // `Range::rows()` iterator borrows the workbook so it's awkward to
@@ -73,7 +100,37 @@ pub async fn run(args: XlsxArgs) -> anyhow::Result<()> {
         .filter(|r| !is_blank_row(r))
         .map(Ok::<_, anyhow::Error>);
 
-    emit_records(records, &idx, &profile, "xlsx", &args.input, args.quiet)
+    emit_records(records, &idx, profile, "xlsx", input, quiet)
+}
+
+/// Stringify the first `max_rows` rows of the chosen sheet as comma-separated
+/// text so [`super::infer`] can show them to Anthropic with the same prompt
+/// the CSV path uses. Cells are escaped with the standard CSV rules so
+/// embedded commas / quotes / newlines don't fool the model.
+pub(super) fn head_as_csv(
+    input: &str,
+    sheet: Option<&str>,
+    max_rows: usize,
+) -> anyhow::Result<String> {
+    let mut wb: Xlsx<_> = open_workbook(input).with_context(|| format!("opening {input}"))?;
+    let range = pick_sheet(&mut wb, sheet)?;
+    let mut out = String::new();
+    for row in range.rows().take(max_rows) {
+        let cells: Vec<String> = row.iter().map(stringify_cell).map(csv_escape).collect();
+        out.push_str(&cells.join(","));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Quote a single CSV field per RFC 4180 (only when needed).
+fn csv_escape(s: String) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        s
+    }
 }
 
 /// Select sheet by name or 0-indexed number-as-string. Defaults to first sheet.
@@ -149,6 +206,14 @@ mod tests {
         assert_eq!(stringify_cell(&Data::Float(12.5)), "12.5");
         assert_eq!(stringify_cell(&Data::String("Acme".into())), "Acme");
         assert_eq!(stringify_cell(&Data::Bool(true)), "true");
+    }
+
+    #[test]
+    fn csv_escape_quotes_when_needed() {
+        assert_eq!(csv_escape("plain".into()), "plain");
+        assert_eq!(csv_escape("with,comma".into()), "\"with,comma\"");
+        assert_eq!(csv_escape("with\"quote".into()), "\"with\"\"quote\"");
+        assert_eq!(csv_escape("with\nnewline".into()), "\"with\nnewline\"");
     }
 
     #[test]
