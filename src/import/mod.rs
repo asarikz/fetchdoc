@@ -14,6 +14,7 @@ use clap::{Args, Subcommand};
 pub(crate) mod csv;
 mod dedup;
 mod infer;
+mod multi;
 mod profile;
 mod xlsx;
 

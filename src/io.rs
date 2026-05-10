@@ -102,6 +102,13 @@ pub struct Transaction {
     /// GnuCash-style account suggestion from `classify` (e.g. `Expenses:Food`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category_guess: Option<String>,
+    /// Optional explicit splits when the source row maps to a GnuCash multi-split
+    /// transaction (e.g. SBI Sumishin debit: principal + 海外事務手数料 separated).
+    /// When set, the sum of `amount_jpy` across splits must equal `-amount_jpy`
+    /// of the parent (i.e. the bank-account leg). When unset, `export gnucash`
+    /// emits a single-row transaction using `category_guess` as the offset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub splits: Option<Vec<Split>>,
     /// Anything else the importer wants to keep around (raw row, file path, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_meta: Option<serde_json::Value>,
@@ -111,6 +118,23 @@ pub struct Transaction {
     /// `"ok"` (default) or `"needs_review"`.
     #[serde(default = "default_status")]
     pub status: String,
+}
+
+/// One leg of a GnuCash multi-split transaction (the offsetting side, viewed
+/// from the bank account's perspective). Positive `amount_jpy` is an outflow
+/// to `account` (the typical case for a debit-card purchase split between
+/// principal and FX fee); negative is a refund.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Split {
+    /// Target GnuCash account, e.g. `Expenses:支払手数料:海外事務手数料`.
+    /// `None` defers to `export gnucash --default-other`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Amount routed to `account`, in JPY. Positive = expense, negative = refund.
+    pub amount_jpy: i64,
+    /// Optional per-split note (becomes the GnuCash split memo).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 fn default_status() -> String {

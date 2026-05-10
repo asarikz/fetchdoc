@@ -1,8 +1,11 @@
 //! GnuCash CSV export.
 //!
-//! Targets the GnuCash 4.x+ "Import Transactions from CSV" format, single-row
-//! per transaction (GnuCash auto-creates the offsetting split using the
-//! `Transfer Account` column).
+//! Targets the GnuCash 4.x+ "Import Transactions from CSV" format. A row whose
+//! `Date` is non-empty starts a new transaction; subsequent rows with empty
+//! `Date` add additional splits to the previous transaction. We use this to
+//! emit foreign debit purchases as principal + 海外事務手数料 on separate
+//! GnuCash accounts. When `Transaction.splits` is `None` we fall back to the
+//! single-row form (GnuCash auto-balances via `Transfer Account`).
 //!
 //! Reads [`Transaction`](crate::io::Transaction) JSONL on stdin (the output
 //! of `import csv` ± `classify`). After writing the CSV, each record is
@@ -12,7 +15,7 @@
 //! `Document` → GnuCash export (the invoice flow) lands once `classify` is
 //! wired up. The current command only handles Transaction records.
 
-use crate::io::{Transaction, read_jsonl_stdin, write_jsonl_stdout};
+use crate::io::{Split, Transaction, read_jsonl_stdin, write_jsonl_stdout};
 use anyhow::Context;
 use clap::Args;
 use serde_json::json;
@@ -88,30 +91,97 @@ fn write_row<W: Write>(
     tx: &Transaction,
     args: &GnucashArgs,
 ) -> anyhow::Result<()> {
-    let (deposit, withdrawal) = if tx.amount_jpy >= 0 {
-        (tx.amount_jpy.to_string(), String::new())
-    } else {
-        (String::new(), (-tx.amount_jpy).to_string())
-    };
-    let other = tx
-        .category_guess
-        .clone()
-        .unwrap_or_else(|| args.default_other.clone());
     let description = tx
         .counterparty_guess
         .clone()
         .unwrap_or_else(|| tx.description_raw.clone());
 
+    // No explicit splits → emit the legacy single-row form so GnuCash's
+    // single-split importer mode still works for the common case.
+    let Some(splits) = tx.splits.as_ref() else {
+        let (deposit, withdrawal) = if tx.amount_jpy >= 0 {
+            (tx.amount_jpy.to_string(), String::new())
+        } else {
+            (String::new(), (-tx.amount_jpy).to_string())
+        };
+        let other = tx
+            .category_guess
+            .clone()
+            .unwrap_or_else(|| args.default_other.clone());
+        wtr.write_record([
+            tx.posted_date.as_str(),
+            description.as_str(),
+            tx.memo.as_deref().unwrap_or(""),
+            args.account.as_str(),
+            deposit.as_str(),
+            withdrawal.as_str(),
+            other.as_str(),
+            args.currency.as_str(),
+        ])?;
+        return Ok(());
+    };
+
+    validate_splits_balance(tx, splits)?;
+
+    // Multi-split: row 1 carries the bank leg + transaction header (Date,
+    // Description, Notes); rows 2..N each add one split with empty
+    // Date/Description so GnuCash treats them as continuations.
+    let (bank_dep, bank_wd) = if tx.amount_jpy >= 0 {
+        (tx.amount_jpy.to_string(), String::new())
+    } else {
+        (String::new(), (-tx.amount_jpy).to_string())
+    };
     wtr.write_record([
         tx.posted_date.as_str(),
         description.as_str(),
         tx.memo.as_deref().unwrap_or(""),
         args.account.as_str(),
-        deposit.as_str(),
-        withdrawal.as_str(),
-        other.as_str(),
+        bank_dep.as_str(),
+        bank_wd.as_str(),
+        "", // Transfer Account unused in multi-split mode
         args.currency.as_str(),
     ])?;
+
+    for split in splits {
+        // Sign convention: positive `amount_jpy` on a Split = expense (money
+        // flowing INTO the offsetting account = Deposit on its books).
+        let (split_dep, split_wd) = if split.amount_jpy >= 0 {
+            (split.amount_jpy.to_string(), String::new())
+        } else {
+            (String::new(), (-split.amount_jpy).to_string())
+        };
+        let acct = split
+            .account
+            .clone()
+            .or_else(|| tx.category_guess.clone())
+            .unwrap_or_else(|| args.default_other.clone());
+        wtr.write_record([
+            "", // Date empty → continuation row
+            "", // Description belongs to the parent
+            split.note.as_deref().unwrap_or(""),
+            acct.as_str(),
+            split_dep.as_str(),
+            split_wd.as_str(),
+            "",
+            args.currency.as_str(),
+        ])?;
+    }
+    Ok(())
+}
+
+/// Multi-split invariant: the offsetting splits must net out the bank leg.
+/// `amount_jpy` on the parent is the bank account's signed delta; the splits
+/// (positive = expense out of bank) must therefore sum to `-amount_jpy`. A
+/// drift here would silently produce an imbalanced transaction in GnuCash.
+fn validate_splits_balance(tx: &Transaction, splits: &[Split]) -> anyhow::Result<()> {
+    let sum: i64 = splits.iter().map(|s| s.amount_jpy).sum();
+    if sum != -tx.amount_jpy {
+        anyhow::bail!(
+            "splits do not balance for {}: sum={sum}, expected={}; check the importer",
+            tx.external_id,
+            -tx.amount_jpy
+        );
+    }
     Ok(())
 }
 
