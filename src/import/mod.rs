@@ -12,6 +12,7 @@
 use clap::{Args, Subcommand};
 
 pub(crate) mod csv;
+mod dedup;
 mod infer;
 mod profile;
 mod xlsx;
@@ -30,11 +31,15 @@ enum ImportCommand {
     Csv(csv::CsvArgs),
     /// Import an .xlsx workbook into Transaction JSONL.
     Xlsx(xlsx::XlsxArgs),
+    /// Drop Transaction records whose external_id already appears in
+    /// a previous JSONL file. Idempotent re-imports.
+    Dedup(dedup::DedupArgs),
 }
 
 pub async fn run(args: ImportArgs) -> anyhow::Result<()> {
     match args.command {
         ImportCommand::Csv(a) => csv::run(a).await,
         ImportCommand::Xlsx(a) => xlsx::run(a).await,
+        ImportCommand::Dedup(a) => dedup::run(a).await,
     }
 }
