@@ -102,17 +102,22 @@ balance     = "差引残高"
 
     let csv_text = std::fs::read_to_string(&gnucash_path).unwrap();
     let csv_lines: Vec<&str> = csv_text.lines().collect();
+    // gnc-trans header.
     assert_eq!(
         csv_lines[0],
-        "Date,Description,Notes,Account,Deposit,Withdrawal,Transfer Account,Commodity/Currency"
+        "Date,Transaction ID,Number,Description,Notes,Commodity/Currency,Void Reason,Action,Memo,Full Account Name,Account Name,Amount With Sym,Amount Num.,Value With Sym,Value Num.,Reconcile,Reconcile Date,Rate/Price"
     );
-    // Withdrawal row: amount in Withdrawal column, Deposit blank.
-    assert!(csv_lines[1].contains("2026-04-30"));
+    // Each Transaction → 2 balanced legs. 2 input rows = header + 4 split rows.
+    assert_eq!(csv_lines.len(), 5);
+    // Withdrawal: bank leg is negative, offset (Imbalance-JPY) positive.
+    assert!(csv_lines[1].contains("04/30/2026"));
     assert!(csv_lines[1].contains("Assets:Bank:SMBC"));
-    assert!(csv_lines[1].contains(",12100,"));
-    assert!(csv_lines[1].contains("Imbalance-JPY"));
-    // Deposit row: amount in Deposit column.
-    assert!(csv_lines[2].contains(",500000,,"));
+    assert!(csv_lines[1].contains(",-12100,"));
+    assert!(csv_lines[2].contains("Imbalance-JPY"));
+    assert!(csv_lines[2].contains(",12100,"));
+    // Deposit: bank leg positive.
+    assert!(csv_lines[3].contains(",500000,"));
+    assert!(csv_lines[3].contains("Assets:Bank:SMBC"));
 }
 
 #[test]

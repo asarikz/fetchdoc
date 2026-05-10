@@ -65,22 +65,38 @@ fn invoice_becomes_debit_expense_credit_payable() {
 
     let csv_text = std::fs::read_to_string(&csv_path).unwrap();
     let lines: Vec<&str> = csv_text.lines().collect();
+    // gnc-trans header (one split per row, balanced).
     assert_eq!(
         lines[0],
-        "Date,Description,Notes,Account,Deposit,Withdrawal,Transfer Account,Commodity/Currency"
+        "Date,Transaction ID,Number,Description,Notes,Commodity/Currency,Void Reason,Action,Memo,Full Account Name,Account Name,Amount With Sym,Amount Num.,Value With Sym,Value Num.,Reconcile,Reconcile Date,Rate/Price"
     );
-    // Row 1: アクメ. T number lands in Notes.
-    assert!(lines[1].contains("2026-04-30"));
+    // Each invoice produces 2 rows (debit + credit). Header + 2 docs * 2 = 5 lines.
+    assert_eq!(lines.len(), 5);
+
+    // Row 1: アクメ debit (Expenses:諸経費, +12100). T number lands in Notes.
+    assert!(lines[1].contains("04/30/2026"));
     assert!(lines[1].contains("アクメ商事"));
     assert!(lines[1].contains("T1234567890123"));
     assert!(lines[1].contains("Expenses:諸経費"));
-    assert!(lines[1].contains(",12100,,")); // Deposit=12100, Withdrawal blank
-    assert!(lines[1].contains("Liabilities:買掛金"));
-    assert!(lines[1].ends_with("JPY"));
-    // Row 2: B社, no T number → Notes is just external_id.
-    assert!(lines[2].contains("2026-05-01"));
-    assert!(lines[2].contains("B社"));
-    assert!(lines[2].contains(",3300,,"));
+    assert!(lines[1].contains("諸経費")); // leaf
+    assert!(lines[1].contains("JP¥12,100"));
+    assert!(lines[1].contains(",12100,"));
+    assert!(lines[1].contains("CURRENCY::JPY"));
+    // Row 2: アクメ credit (Liabilities:買掛金, -12100), same Transaction ID.
+    let txid_1 = lines[1].split(',').nth(1).unwrap();
+    let txid_2 = lines[2].split(',').nth(1).unwrap();
+    assert_eq!(txid_1, txid_2, "split rows share Transaction ID");
+    assert!(lines[2].contains("Liabilities:買掛金"));
+    assert!(lines[2].contains("-JP¥12,100"));
+    assert!(lines[2].contains(",-12100,"));
+
+    // Row 3: B社 debit, no T number → Notes is just external_id.
+    assert!(lines[3].contains("05/01/2026"));
+    assert!(lines[3].contains("B社"));
+    assert!(lines[3].contains("JP¥3,300"));
+    // Different transaction → different Transaction ID.
+    let txid_3 = lines[3].split(',').nth(1).unwrap();
+    assert_ne!(txid_1, txid_3);
 
     // JSONL passthrough has exported.gnucash.out
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -145,9 +161,10 @@ fn document_without_extracted_is_skipped_as_needs_review() {
 
     let csv_text = std::fs::read_to_string(&csv_path).unwrap();
     let lines: Vec<&str> = csv_text.lines().collect();
-    // Header + only the second (ok) row.
-    assert_eq!(lines.len(), 2);
+    // Header + 2 rows for the single ok document (debit + credit).
+    assert_eq!(lines.len(), 3);
     assert!(lines[1].contains("X"));
+    assert!(lines[2].contains("Liabilities:買掛金"));
 
     let stdout = String::from_utf8(out.stdout).unwrap();
     let jl: Vec<serde_json::Value> = stdout

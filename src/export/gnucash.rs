@@ -1,23 +1,23 @@
 //! GnuCash CSV export.
 //!
-//! Targets the GnuCash 4.x+ "Import Transactions from CSV" format. A row whose
-//! `Date` is non-empty starts a new transaction; subsequent rows with empty
-//! `Date` add additional splits to the previous transaction. We use this to
-//! emit foreign debit purchases as principal + 海外事務手数料 on separate
-//! GnuCash accounts. When `Transaction.splits` is `None` we fall back to the
-//! single-row form (GnuCash auto-balances via `Transfer Account`).
+//! Targets GnuCash's **Transaction Export CSV** (the "gnc-trans" preset that
+//! GnuCash's own `File → Export → Export Transactions to CSV` produces). One
+//! split per row; rows belonging to the same transaction share the `Transaction
+//! ID` column. The user re-imports it via `File → Import → Import Transactions
+//! from CSV` and picks the bundled "gnc-trans" preset — no column mapping
+//! needed.
 //!
 //! Reads either [`Transaction`](crate::io::Transaction) or
 //! [`Document`](crate::io::Document) JSONL on stdin and dispatches per-record:
 //!
 //! - **Transaction** (bank/card statement row from `import csv` ± `classify`)
-//!   → uses `--account` as the bank leg, `--default-other` (or
-//!   `category_guess`) as the offset.
-//! - **Document** (invoice PDF from `fetch ... | classify`) → emits the
-//!   classical accrual A/P pair: `--debit-account` for the expense,
-//!   `--credit-account` for the payable. The CSV row uses GnuCash's
-//!   single-split form (Account / Deposit / Transfer Account).
+//!   → bank leg uses `--account`; the offsetting leg uses each split's
+//!   `account` (or `category_guess`, or `--default-other`).
+//! - **Document** (invoice PDF from `fetch ... | classify`) → standard accrual
+//!   A/P pair: `--debit-account` for the expense, `--credit-account` for the
+//!   payable.
 //!
+//! Every transaction is double-entry balanced (split amounts sum to zero).
 //! After writing the CSV, each record is re-emitted on stdout with
 //! `exported.gnucash = ...` so further export targets can chain.
 
@@ -237,17 +237,28 @@ pub async fn run(args: GnucashArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// GnuCash 4.x importer columns. Field names match the labels GnuCash shows
-/// in the CSV import wizard, so the user can map them by name in one click.
+/// GnuCash transaction-export columns ("gnc-trans" preset). Order and labels
+/// must match GnuCash's own export, otherwise the matching import preset
+/// won't recognise the file.
 const HEADER: &[&str] = &[
     "Date",
+    "Transaction ID",
+    "Number",
     "Description",
     "Notes",
-    "Account",
-    "Deposit",
-    "Withdrawal",
-    "Transfer Account",
     "Commodity/Currency",
+    "Void Reason",
+    "Action",
+    "Memo",
+    "Full Account Name",
+    "Account Name",
+    "Amount With Sym",
+    "Amount Num.",
+    "Value With Sym",
+    "Value Num.",
+    "Reconcile",
+    "Reconcile Date",
+    "Rate/Price",
 ];
 
 enum RecordKind {
@@ -292,82 +303,64 @@ fn write_transaction_row<W: Write>(
         .or_else(|| tx.description_normalized.clone())
         .unwrap_or_else(|| tx.description_raw.clone());
 
-    // No explicit splits → emit the legacy single-row form so GnuCash's
-    // single-split importer mode still works for the common case.
-    let Some(splits) = tx.splits.as_ref() else {
-        let (deposit, withdrawal) = if tx.amount_jpy >= 0 {
-            (tx.amount_jpy.to_string(), String::new())
-        } else {
-            (String::new(), (-tx.amount_jpy).to_string())
-        };
+    let date = format_date_us(&tx.posted_date)?;
+    let txid = transaction_id_for(&tx.external_id);
+    let notes = tx.memo.as_deref().unwrap_or("");
+
+    // Build the split list. With explicit splits, the bank leg amount equals
+    // the parent's signed amount and the rest comes from `tx.splits`. Without
+    // splits, fabricate a two-leg transaction so the export is always balanced.
+    let mut legs: Vec<Leg> = Vec::new();
+    legs.push(Leg {
+        account: account.to_string(),
+        amount: tx.amount_jpy,
+        memo: String::new(),
+    });
+    if let Some(splits) = tx.splits.as_ref() {
+        validate_splits_balance(tx, splits)?;
+        for split in splits {
+            // Convention on Split: positive = money flowing INTO the offset
+            // account when it's an expense booking. GnuCash's signed Amount
+            // wants the same sign on the offset side, so pass through as-is.
+            let acct = split
+                .account
+                .clone()
+                .or_else(|| tx.category_guess.clone())
+                .unwrap_or_else(|| args.default_other.clone());
+            legs.push(Leg {
+                account: acct,
+                amount: split.amount_jpy,
+                memo: split.note.clone().unwrap_or_default(),
+            });
+        }
+    } else {
+        // No explicit splits → fabricate the offset leg so the row pair is
+        // self-balancing instead of relying on GnuCash's auto-balance.
         let other = tx
             .category_guess
             .clone()
             .unwrap_or_else(|| args.default_other.clone());
-        wtr.write_record([
-            tx.posted_date.as_str(),
-            description.as_str(),
-            tx.memo.as_deref().unwrap_or(""),
-            account,
-            deposit.as_str(),
-            withdrawal.as_str(),
-            other.as_str(),
-            args.currency.as_str(),
-        ])?;
-        return Ok(());
-    };
-
-    validate_splits_balance(tx, splits)?;
-
-    // Multi-split: row 1 carries the bank leg + transaction header (Date,
-    // Description, Notes); rows 2..N each add one split with empty
-    // Date/Description so GnuCash treats them as continuations.
-    let (bank_dep, bank_wd) = if tx.amount_jpy >= 0 {
-        (tx.amount_jpy.to_string(), String::new())
-    } else {
-        (String::new(), (-tx.amount_jpy).to_string())
-    };
-    wtr.write_record([
-        tx.posted_date.as_str(),
-        description.as_str(),
-        tx.memo.as_deref().unwrap_or(""),
-        account,
-        bank_dep.as_str(),
-        bank_wd.as_str(),
-        "", // Transfer Account unused in multi-split mode
-        args.currency.as_str(),
-    ])?;
-
-    for split in splits {
-        // Sign convention: positive `amount_jpy` on a Split = expense (money
-        // flowing INTO the offsetting account = Deposit on its books).
-        let (split_dep, split_wd) = if split.amount_jpy >= 0 {
-            (split.amount_jpy.to_string(), String::new())
-        } else {
-            (String::new(), (-split.amount_jpy).to_string())
-        };
-        let acct = split
-            .account
-            .clone()
-            .or_else(|| tx.category_guess.clone())
-            .unwrap_or_else(|| args.default_other.clone());
-        wtr.write_record([
-            "", // Date empty → continuation row
-            "", // Description belongs to the parent
-            split.note.as_deref().unwrap_or(""),
-            acct.as_str(),
-            split_dep.as_str(),
-            split_wd.as_str(),
-            "",
-            args.currency.as_str(),
-        ])?;
+        legs.push(Leg {
+            account: other,
+            amount: -tx.amount_jpy,
+            memo: String::new(),
+        });
     }
-    Ok(())
+
+    write_split_rows(
+        wtr,
+        &date,
+        &txid,
+        &description,
+        notes,
+        &legs,
+        &args.currency,
+    )
 }
 
-/// Emit one GnuCash row for an invoice/receipt: debit the expense account,
-/// credit the payable (or cash). T number lands in the Notes column where
-/// GnuCash makes it searchable.
+/// Emit a balanced two-leg transaction for an invoice/receipt: debit the
+/// expense account, credit the payable (or cash). T number lands in the Notes
+/// column where GnuCash makes it searchable.
 fn write_document_row<W: Write>(
     wtr: &mut csv::Writer<W>,
     doc: &Document,
@@ -376,21 +369,80 @@ fn write_document_row<W: Write>(
     credit_account: &str,
     args: &GnucashArgs,
 ) -> anyhow::Result<()> {
-    let amount = extracted.total_amount_jpy.to_string();
+    let date = format_date_us(&extracted.transaction_date)?;
+    let txid = transaction_id_for(&doc.external_id);
     let notes = match extracted.counterparty_t_number.as_deref() {
         Some(t) => format!("T={t} ({})", doc.external_id),
         None => doc.external_id.clone(),
     };
-    wtr.write_record([
-        extracted.transaction_date.as_str(),
-        extracted.counterparty_name.as_str(),
-        notes.as_str(),
-        debit_account,
-        amount.as_str(), // Deposit on the debit-account side = expense recognised
-        "",
-        credit_account,
-        args.currency.as_str(),
-    ])?;
+    let amount = extracted.total_amount_jpy;
+    let legs = [
+        Leg {
+            account: debit_account.to_string(),
+            amount, // Debit expense (positive)
+            memo: String::new(),
+        },
+        Leg {
+            account: credit_account.to_string(),
+            amount: -amount, // Credit payable / cash (negative)
+            memo: String::new(),
+        },
+    ];
+    write_split_rows(
+        wtr,
+        &date,
+        &txid,
+        &extracted.counterparty_name,
+        &notes,
+        &legs,
+        &args.currency,
+    )
+}
+
+/// One split row in a balanced GnuCash transaction.
+struct Leg {
+    account: String,
+    amount: i64,
+    memo: String,
+}
+
+/// Emit one CSV row per leg, all sharing the same Date / Transaction ID /
+/// Description / Notes — that's how GnuCash's import wizard groups rows back
+/// into a single multi-split transaction.
+fn write_split_rows<W: Write>(
+    wtr: &mut csv::Writer<W>,
+    date: &str,
+    txid: &str,
+    description: &str,
+    notes: &str,
+    legs: &[Leg],
+    currency: &str,
+) -> anyhow::Result<()> {
+    let commodity = format!("CURRENCY::{currency}");
+    for leg in legs {
+        let (with_sym, num) = format_amount(leg.amount, currency);
+        let leaf = leaf_account(&leg.account);
+        wtr.write_record([
+            date,
+            txid,
+            "", // Number
+            description,
+            notes,
+            commodity.as_str(),
+            "", // Void Reason
+            "", // Action
+            leg.memo.as_str(),
+            leg.account.as_str(),
+            leaf,
+            with_sym.as_str(),
+            num.as_str(),
+            with_sym.as_str(), // Value mirrors Amount in single-currency mode
+            num.as_str(),
+            "n", // Reconcile = not reconciled
+            "",  // Reconcile Date
+            "1.00",
+        ])?;
+    }
     Ok(())
 }
 
@@ -452,4 +504,79 @@ fn merge_exported_doc(
 struct PickerCtx {
     chart: Chart,
     client: crate::anthropic::Client,
+}
+
+/// Convert `YYYY-MM-DD` (our canonical form) to `MM/DD/YYYY` (GnuCash's export
+/// default). The import preset reads the date format from a sibling sidecar
+/// when available; emitting US-style keeps round-tripping with GnuCash's own
+/// export.
+fn format_date_us(iso: &str) -> anyhow::Result<String> {
+    let bytes = iso.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        anyhow::bail!("expected YYYY-MM-DD date, got {iso:?}");
+    }
+    Ok(format!("{}/{}/{}", &iso[5..7], &iso[8..10], &iso[0..4]))
+}
+
+/// Last segment of a colon-delimited GnuCash full account name.
+/// `Assets:Bank:GMO` → `GMO`. Empty input → empty.
+fn leaf_account(full: &str) -> &str {
+    full.rsplit(':').next().unwrap_or(full)
+}
+
+/// Format a signed integer amount as the `(Amount With Sym, Amount Num.)` pair
+/// GnuCash writes. JPY (and other zero-decimal currencies) get integer output
+/// with `JP¥` symbol; anything else falls back to `<CODE> <number>`.
+fn format_amount(amount: i64, currency: &str) -> (String, String) {
+    let num = amount.to_string();
+    let symbol = currency_symbol(currency);
+    let abs = amount.unsigned_abs();
+    let with_sep = thousands(abs);
+    let with_sym = if amount < 0 {
+        format!("-{symbol}{with_sep}")
+    } else {
+        format!("{symbol}{with_sep}")
+    };
+    (with_sym, num)
+}
+
+fn currency_symbol(code: &str) -> &'static str {
+    match code {
+        "JPY" => "JP¥",
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        // Fallback: empty prefix; the Commodity/Currency column still
+        // disambiguates on import.
+        _ => "",
+    }
+}
+
+/// Comma-grouped thousands. `2700000` → `2,700,000`. ASCII-only input.
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let len = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Stable 32-hex Transaction ID derived from the source's external id. Same
+/// shape as GnuCash's own GUIDs (32 hex chars, no dashes). Re-running the
+/// export on the same record produces the same id, which makes idempotent
+/// re-imports possible if the user wires that up.
+fn transaction_id_for(external_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(external_id.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for b in &digest[..16] {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
 }
