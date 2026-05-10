@@ -8,6 +8,7 @@ mod export;
 mod import;
 mod invoicing_jp;
 mod io;
+mod render_body;
 mod sources;
 
 #[tokio::main]

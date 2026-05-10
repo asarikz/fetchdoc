@@ -8,9 +8,13 @@ use clap::{Args, Subcommand};
 
 mod eml;
 mod gmail;
-mod mail;
 mod maildir;
 mod mbox;
+
+// Re-exported so the `render-body` command (and any future consumer outside
+// this module) can reuse `pick_primary_body_part` / `find_part_by_index` /
+// `default_cache_dir` without having to live under `fetch`.
+pub mod mail;
 
 #[derive(Args, Debug)]
 pub struct FetchArgs {

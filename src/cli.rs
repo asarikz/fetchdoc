@@ -25,6 +25,10 @@ pub enum Command {
     Import(crate::import::ImportArgs),
     /// Classify and extract structured data from documents on stdin.
     Classify(crate::classify::ClassifyArgs),
+    /// Render body-primary email records to PDF (Document JSONL → JSONL).
+    /// Insert between `fetch` and `classify` when receipts may arrive in the
+    /// email body itself rather than as a PDF attachment.
+    RenderBody(crate::render_body::RenderBodyArgs),
     /// Export classified documents (read JSONL on stdin).
     Export(crate::export::ExportArgs),
     /// Validate a Japanese qualified-invoice T number against the NTA registry.
@@ -41,6 +45,7 @@ impl Cli {
             Command::Fetch(args) => crate::sources::run(args).await,
             Command::Import(args) => crate::import::run(args).await,
             Command::Classify(args) => crate::classify::run(args).await,
+            Command::RenderBody(args) => crate::render_body::run(args).await,
             Command::Export(args) => crate::export::run(args).await,
             Command::VerifyTnumber { tnumber } => {
                 crate::invoicing_jp::verify_tnumber(&tnumber).await

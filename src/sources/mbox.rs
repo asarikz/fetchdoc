@@ -228,6 +228,10 @@ fn process_message(
         progress_tag: PROGRESS_TAG,
         progress_label: &label,
         quiet,
+        raw_bytes: raw,
+        // mbox stores messages concatenated — there's no per-message file to
+        // point at. Let the body-primary path materialise one in the cache.
+        eml_on_disk: None,
     };
     mail::process_parsed_message(&parsed, &opts)
 }

@@ -76,6 +76,29 @@ All three subcommands extract every PDF attachment into a cache directory
 and emit the same Document JSONL that `fetch gmail` will produce — so the
 rest of the pipeline is identical.
 
+### Receipts that arrive as the email body itself
+
+Some receipts (Stripe / AWS / many SaaS billing notices) ship the invoice
+*as the email body* with no PDF attached. For those, the `fetch` sources
+emit a **body-primary** record (no `attachment_path`, but
+`source_meta.body_is_primary == true` plus an `eml_path` pointing at the
+underlying `.eml`). Run `fetchdoc render-body` between fetch and classify
+to render those bodies to PDF for 電帳法 archival:
+
+```sh
+fetchdoc fetch eml --dir ~/mail-export \
+  | fetchdoc render-body \
+  | fetchdoc classify \
+  | fetchdoc export local --root ~/受領請求書
+```
+
+`render-body` shells out to whichever HTML→PDF tool is on your `$PATH` —
+checked in order: chromium / google-chrome (recommended), `weasyprint`,
+`wkhtmltopdf` (deprecated, used only as a last resort). Pass
+`--renderer chromium|weasyprint|wkhtmltopdf` to pin a specific one.
+Records that already have an `attachment_path` are passed through
+untouched, so it's safe to keep `render-body` in every pipeline.
+
 ## Quick start
 
 ```sh
@@ -109,6 +132,7 @@ fetchdoc export gnucash \
 | `fetch eml --dir PATH` | — | JSONL of `Document` records (no OAuth) |
 | `fetch mbox --file PATH` / `--dir PATH` | — | JSONL of `Document` records (no OAuth) |
 | `fetch maildir --dir PATH` | — | JSONL of `Document` records (no OAuth) |
+| `render-body [--renderer auto\|chromium\|weasyprint\|wkhtmltopdf]` | JSONL | JSONL with rendered-PDF `attachment_path` for body-primary records |
 | `classify [--ocr=anthropic\|vertex\|openai]` | JSONL | JSONL with `extracted` field |
 | `export local --root PATH` | JSONL | files + JSONL with `exported` field |
 | `export gnucash --out CSV` | JSONL | CSV file + JSONL |

@@ -142,6 +142,10 @@ fn process_file(
         progress_tag: PROGRESS_TAG,
         progress_label: &path_str,
         quiet,
+        raw_bytes: &raw,
+        // The .eml is already on disk at the user's path — point body-primary
+        // records there directly instead of duplicating into the cache.
+        eml_on_disk: Some(path),
     };
     mail::process_parsed_message(&parsed, &opts)
 }

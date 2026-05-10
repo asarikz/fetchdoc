@@ -53,6 +53,95 @@ pub fn collect_pdf_attachments(part: &ParsedMail<'_>, out: &mut Vec<PdfAttachmen
     }
 }
 
+/// The MIME part chosen as the message's primary body — used when no PDF is
+/// attached and the email *itself* is the receipt (Stripe/AWS-style HTML
+/// receipts, body-only billing notices). `render-body` consumes the same
+/// information later to render the body to PDF for 電帳法 archival.
+#[derive(Debug, Clone)]
+pub struct PrimaryBody {
+    /// Depth-first preorder index of this part in the MIME tree (root = 0).
+    /// Stable as long as the underlying RFC 822 bytes are unchanged.
+    pub part_index: usize,
+    /// `"text/html"` or `"text/plain"`.
+    pub mime_type: String,
+}
+
+/// Pick the MIME part that should stand in as the receipt body when no PDF is
+/// attached. Walks depth-first, ignores parts whose `Content-Disposition` is
+/// `attachment`, and prefers `text/html` over `text/plain`. Returns `None`
+/// when nothing usable is found (e.g. attachment-only messages, or bodies
+/// that are neither text/html nor text/plain).
+pub fn pick_primary_body_part(mail: &ParsedMail<'_>) -> Option<PrimaryBody> {
+    let mut html: Option<PrimaryBody> = None;
+    let mut plain: Option<PrimaryBody> = None;
+    let mut counter: usize = 0;
+    walk_for_body(mail, &mut counter, &mut html, &mut plain);
+    html.or(plain)
+}
+
+fn walk_for_body(
+    part: &ParsedMail<'_>,
+    counter: &mut usize,
+    html: &mut Option<PrimaryBody>,
+    plain: &mut Option<PrimaryBody>,
+) {
+    let idx = *counter;
+    *counter += 1;
+
+    let is_attachment = matches!(
+        part.get_content_disposition().disposition,
+        mailparse::DispositionType::Attachment
+    );
+    let mime = part.ctype.mimetype.to_ascii_lowercase();
+
+    if !is_attachment {
+        if mime == "text/html" && html.is_none() {
+            *html = Some(PrimaryBody {
+                part_index: idx,
+                mime_type: mime.clone(),
+            });
+        } else if mime == "text/plain" && plain.is_none() {
+            *plain = Some(PrimaryBody {
+                part_index: idx,
+                mime_type: mime.clone(),
+            });
+        }
+    }
+
+    for sub in &part.subparts {
+        walk_for_body(sub, counter, html, plain);
+    }
+}
+
+/// Re-walk a parsed message and return the part at `target_index`. Used by
+/// `render-body` to recover the body bytes after re-parsing the cached `.eml`.
+/// Numbering matches [`pick_primary_body_part`] (depth-first preorder).
+pub fn find_part_by_index<'a, 'b>(
+    mail: &'a ParsedMail<'b>,
+    target_index: usize,
+) -> Option<&'a ParsedMail<'b>> {
+    let mut counter: usize = 0;
+    find_part_inner(mail, target_index, &mut counter)
+}
+
+fn find_part_inner<'a, 'b>(
+    part: &'a ParsedMail<'b>,
+    target_index: usize,
+    counter: &mut usize,
+) -> Option<&'a ParsedMail<'b>> {
+    let idx = *counter;
+    *counter += 1;
+    if idx == target_index {
+        return Some(part);
+    }
+    for sub in &part.subparts {
+        if let Some(found) = find_part_inner(sub, target_index, counter) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Parse a `Date:` header into a `NaiveDate`. Tries `mailparse::dateparse`
 /// first (lenient — tolerates wrong day-of-week, missing seconds, etc.) and
 /// falls back to chrono's strict RFC 2822 parser.
@@ -140,7 +229,8 @@ pub fn default_cache_dir(subdir: &str) -> Result<PathBuf> {
 pub struct ProcessOpts<'a> {
     /// `"eml"`, `"mbox"`, etc. Goes into `Document.source`.
     pub source: &'a str,
-    /// Where to write extracted PDFs.
+    /// Where to write extracted PDFs (and, for body-primary messages, the
+    /// materialised `.eml` when [`Self::eml_on_disk`] is `None`).
     pub cache_dir: &'a Path,
     /// Drop the message if its `Date:` header is older than this.
     pub since: Option<NaiveDate>,
@@ -156,11 +246,21 @@ pub struct ProcessOpts<'a> {
     pub progress_label: &'a str,
     /// If true, skip the per-message stderr lines.
     pub quiet: bool,
+    /// Raw RFC 822 bytes of this message. Required so the body-primary path
+    /// can either reference an on-disk `.eml` (eml/maildir) or materialise
+    /// one in the cache (mbox, gmail) for `render-body` to read later.
+    pub raw_bytes: &'a [u8],
+    /// `Some(path)` when the source already keeps this message as a single
+    /// `.eml` on disk (eml, maildir). `None` when the source can't (mbox
+    /// concatenates many messages, gmail is remote) — in that case the
+    /// body-primary path writes `<cache_dir>/<external_id>.eml` and uses it.
+    pub eml_on_disk: Option<&'a Path>,
 }
 
-/// Apply `--since`, extract PDFs, write them to disk, and emit one Document
-/// per attachment. Returns an empty Vec when the message has no PDFs or the
-/// `Date:` header is older than `since`.
+/// Apply `--since`, extract PDFs (or fall back to the body when there are
+/// none), write artefacts to disk, and emit one Document per output. Returns
+/// an empty Vec when the `Date:` header is older than `since`, or when there
+/// are no PDFs *and* no usable body part.
 pub fn process_parsed_message(
     parsed: &ParsedMail<'_>,
     opts: &ProcessOpts<'_>,
@@ -175,18 +275,14 @@ pub fn process_parsed_message(
 
     let subject = parsed.headers.get_first_value("Subject");
     let from = parsed.headers.get_first_value("From");
+    let to = parsed.headers.get_first_value("To");
     let message_id = parsed.headers.get_first_value("Message-ID");
 
     let mut pdfs = Vec::new();
     collect_pdf_attachments(parsed, &mut pdfs);
+
     if pdfs.is_empty() {
-        if !opts.quiet {
-            eprintln!(
-                "{}: {}: no PDF attachments",
-                opts.progress_tag, opts.progress_label
-            );
-        }
-        return Ok(Vec::new());
+        return body_primary_record(parsed, opts, &subject, &from, &to, &date_str, &message_id);
     }
 
     let mut docs = Vec::with_capacity(pdfs.len());
@@ -246,6 +342,112 @@ pub fn process_parsed_message(
     Ok(docs)
 }
 
+/// Emit a single body-primary Document when the message has no PDF
+/// attachments but does have a usable text/html or text/plain body. This is
+/// the path that lets `render-body` later turn the email into a PDF for
+/// 電帳法 archival (some receipts arrive purely in the body, no attachment).
+fn body_primary_record(
+    parsed: &ParsedMail<'_>,
+    opts: &ProcessOpts<'_>,
+    subject: &Option<String>,
+    from: &Option<String>,
+    to: &Option<String>,
+    date_str: &Option<String>,
+    message_id: &Option<String>,
+) -> Result<Vec<Document>> {
+    // Require at least one of the basic identifying headers before treating
+    // a parse result as a real email. mailparse is lenient enough that random
+    // binary garbage parses as a degenerate text/plain message — we don't
+    // want such input to silently flow into the pipeline as a body-primary
+    // "receipt".
+    let has_real_headers =
+        subject.is_some() || from.is_some() || date_str.is_some() || message_id.is_some();
+    if !has_real_headers {
+        if !opts.quiet {
+            eprintln!(
+                "{}: {}: no PDF attachment and no recognisable mail headers — skipping",
+                opts.progress_tag, opts.progress_label
+            );
+        }
+        return Ok(Vec::new());
+    }
+
+    let Some(body) = pick_primary_body_part(parsed) else {
+        if !opts.quiet {
+            eprintln!(
+                "{}: {}: no PDF attachment and no usable body part — skipping",
+                opts.progress_tag, opts.progress_label
+            );
+        }
+        return Ok(Vec::new());
+    };
+
+    let external_id = match message_id.as_deref() {
+        Some(id) => id
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string(),
+        None => {
+            let mut seeds: Vec<&[u8]> = opts.fallback_seeds.to_vec();
+            seeds.push(b"body-primary");
+            fallback_id(&seeds)
+        }
+    };
+
+    // Resolve the .eml location: caller-provided on-disk path wins; otherwise
+    // materialise a copy in the cache dir under a sanitised id.
+    let eml_path: PathBuf = match opts.eml_on_disk {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let dest = opts
+                .cache_dir
+                .join(format!("{}.eml", sanitize_filename(&external_id)));
+            std::fs::write(&dest, opts.raw_bytes)
+                .with_context(|| format!("writing cached eml {}", dest.display()))?;
+            dest
+        }
+    };
+
+    if !opts.quiet {
+        eprintln!(
+            "{}: {} → body-primary ({}, eml={})",
+            opts.progress_tag,
+            opts.progress_label,
+            body.mime_type,
+            eml_path.display()
+        );
+    }
+
+    let mut meta = json!({
+        "subject": subject,
+        "from": from,
+        "to": to,
+        "date": date_str,
+        "body_is_primary": true,
+        "body_part_index": body.part_index,
+        "body_mime_type": body.mime_type,
+        "eml_path": eml_path.to_string_lossy(),
+    });
+    if let Value::Object(ref mut m) = meta {
+        for (k, v) in &opts.extra_meta {
+            // Don't let source-provided extras silently overwrite the
+            // canonical body-primary keys we just set above.
+            m.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+
+    Ok(vec![Document {
+        source: opts.source.to_string(),
+        external_id,
+        attachment_path: None,
+        source_meta: Some(meta),
+        extracted: None,
+        exported: None,
+        status: "ok".to_string(),
+    }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +480,82 @@ mod tests {
         assert_eq!(d, NaiveDate::from_ymd_opt(2026, 4, 30).unwrap());
         assert!(parse_header_date("30 Apr 2026 10:00:00 +0900").is_some());
         assert!(parse_header_date("Wed, 30 Apr 2026 10:00:00 +0900").is_some());
+    }
+
+    #[test]
+    fn pick_primary_body_prefers_html_over_plain() {
+        let raw = b"From: a@example.com\r\n\
+                    Subject: Hi\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/alternative; boundary=BDY\r\n\
+                    \r\n\
+                    --BDY\r\n\
+                    Content-Type: text/plain; charset=utf-8\r\n\
+                    \r\n\
+                    plain version\r\n\
+                    --BDY\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\
+                    \r\n\
+                    <p>html version</p>\r\n\
+                    --BDY--\r\n";
+        let parsed = parse_mail(raw).unwrap();
+        let body = pick_primary_body_part(&parsed).expect("must find body");
+        assert_eq!(body.mime_type, "text/html");
+        // root=0, first leaf (plain)=1, second leaf (html)=2
+        assert_eq!(body.part_index, 2);
+        let part = find_part_by_index(&parsed, body.part_index).expect("re-find");
+        assert_eq!(part.ctype.mimetype, "text/html");
+    }
+
+    #[test]
+    fn pick_primary_body_falls_back_to_plain() {
+        let raw = b"From: a@example.com\r\n\
+                    Subject: Hi\r\n\
+                    Content-Type: text/plain; charset=utf-8\r\n\
+                    \r\n\
+                    just plain\r\n";
+        let parsed = parse_mail(raw).unwrap();
+        let body = pick_primary_body_part(&parsed).expect("must find body");
+        assert_eq!(body.mime_type, "text/plain");
+        assert_eq!(body.part_index, 0);
+    }
+
+    #[test]
+    fn pick_primary_body_skips_attachment_disposition() {
+        // An attached text/html (Content-Disposition: attachment) should not
+        // be picked as the primary body — that's a literal HTML attachment,
+        // not the receipt body.
+        let raw = b"From: a@example.com\r\n\
+                    Subject: Hi\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/mixed; boundary=BDY\r\n\
+                    \r\n\
+                    --BDY\r\n\
+                    Content-Type: text/html\r\n\
+                    Content-Disposition: attachment; filename=\"x.html\"\r\n\
+                    \r\n\
+                    <p>not the body</p>\r\n\
+                    --BDY--\r\n";
+        let parsed = parse_mail(raw).unwrap();
+        assert!(pick_primary_body_part(&parsed).is_none());
+    }
+
+    #[test]
+    fn pick_primary_body_returns_none_when_only_pdfs() {
+        let raw = b"From: a@example.com\r\n\
+                    Subject: Hi\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/mixed; boundary=BDY\r\n\
+                    \r\n\
+                    --BDY\r\n\
+                    Content-Type: application/pdf\r\n\
+                    Content-Disposition: attachment; filename=\"a.pdf\"\r\n\
+                    Content-Transfer-Encoding: base64\r\n\
+                    \r\n\
+                    JVBERi0xLjQKJSVFT0YK\r\n\
+                    --BDY--\r\n";
+        let parsed = parse_mail(raw).unwrap();
+        assert!(pick_primary_body_part(&parsed).is_none());
     }
 
     #[test]

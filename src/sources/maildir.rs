@@ -200,6 +200,10 @@ fn process_file(
         progress_tag: PROGRESS_TAG,
         progress_label: &path_str,
         quiet,
+        raw_bytes: &raw,
+        // Each maildir message is its own file under cur/new — point body-
+        // primary records straight at it instead of duplicating into cache.
+        eml_on_disk: Some(path),
     };
     mail::process_parsed_message(&parsed, &opts)
 }
