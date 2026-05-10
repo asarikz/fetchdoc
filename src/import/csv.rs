@@ -96,13 +96,44 @@ fn parse_into_jsonl(
     let idx = build_index(&headers, &profile.columns)
         .with_context(|| format!("profile {} header lookup", profile.name))?;
 
+    let records = rdr
+        .records()
+        .skip(profile.skip_rows)
+        .map(|r| r.map_err(anyhow::Error::from));
+    emit_records(records, &idx, profile, "csv", source_label, quiet)
+}
+
+/// Shared row-emission loop used by both `import csv` and `import xlsx`.
+/// Each input row is mapped to a [`Transaction`], written as JSONL on stdout,
+/// and counted; per-row failures are skipped (with stderr warning unless
+/// `quiet`) so a few bad rows don't kill an otherwise-good import.
+pub(super) fn emit_records<I>(
+    records: I,
+    idx: &ColumnIndex,
+    profile: &Profile,
+    source_kind: &'static str,
+    source_label: &str,
+    quiet: bool,
+) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = anyhow::Result<csv::StringRecord>>,
+{
     let mut emitted = 0usize;
     let mut skipped = 0usize;
     let mut needs_review = 0usize;
 
-    for (row_no, rec_res) in rdr.records().enumerate().skip(profile.skip_rows) {
-        let rec = rec_res.with_context(|| format!("row {}", row_no + 1))?;
-        match build_transaction(&rec, &idx, profile, source_label) {
+    for (row_no, rec_res) in records.into_iter().enumerate() {
+        let rec = match rec_res {
+            Ok(r) => r,
+            Err(e) => {
+                skipped += 1;
+                if !quiet {
+                    eprintln!("skip row {}: {e:#}", row_no + 1);
+                }
+                continue;
+            }
+        };
+        match build_transaction(&rec, idx, profile, source_kind, source_label) {
             Ok(tx) => {
                 if tx.status == "needs_review" {
                     needs_review += 1;
@@ -121,7 +152,7 @@ fn parse_into_jsonl(
 
     if !quiet {
         eprintln!(
-            "import csv: {emitted} ok, {needs_review} needs_review, {skipped} skipped (profile {})",
+            "import {source_kind}: {emitted} ok, {needs_review} needs_review, {skipped} skipped (profile {})",
             profile.name
         );
     }
@@ -133,7 +164,7 @@ fn parse_into_jsonl(
 }
 
 /// Resolve column names → indices once, up front, so per-row lookup is O(1).
-struct ColumnIndex {
+pub(super) struct ColumnIndex {
     posted_date: usize,
     description: usize,
     amount: Option<usize>,
@@ -144,7 +175,7 @@ struct ColumnIndex {
     value_date: Option<usize>,
 }
 
-fn build_index(
+pub(super) fn build_index(
     headers: &csv::StringRecord,
     cols: &super::profile::Columns,
 ) -> anyhow::Result<ColumnIndex> {
@@ -174,6 +205,7 @@ fn build_transaction(
     rec: &csv::StringRecord,
     idx: &ColumnIndex,
     profile: &Profile,
+    source_kind: &'static str,
     source_label: &str,
 ) -> anyhow::Result<Transaction> {
     let posted_raw = field(rec, idx.posted_date)?;
@@ -229,7 +261,7 @@ fn build_transaction(
     .to_string();
 
     Ok(Transaction {
-        source: "csv".to_string(),
+        source: source_kind.to_string(),
         source_profile: Some(profile.name.clone()),
         external_id,
         posted_date,
@@ -406,7 +438,7 @@ balance = "差引残高"
         let idx = build_index(&headers, &profile.columns).unwrap();
         let recs: Vec<_> = rdr
             .records()
-            .map(|r| build_transaction(&r.unwrap(), &idx, &profile, "test.csv").unwrap())
+            .map(|r| build_transaction(&r.unwrap(), &idx, &profile, "csv", "test.csv").unwrap())
             .collect();
 
         assert_eq!(recs.len(), 2);

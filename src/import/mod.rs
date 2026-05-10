@@ -11,9 +11,10 @@
 
 use clap::{Args, Subcommand};
 
-mod csv;
+pub(crate) mod csv;
 mod infer;
 mod profile;
+mod xlsx;
 
 pub use profile::Profile;
 
@@ -27,10 +28,13 @@ pub struct ImportArgs {
 enum ImportCommand {
     /// Import a delimited text file (CSV / TSV) into Transaction JSONL.
     Csv(csv::CsvArgs),
+    /// Import an .xlsx workbook into Transaction JSONL.
+    Xlsx(xlsx::XlsxArgs),
 }
 
 pub async fn run(args: ImportArgs) -> anyhow::Result<()> {
     match args.command {
         ImportCommand::Csv(a) => csv::run(a).await,
+        ImportCommand::Xlsx(a) => xlsx::run(a).await,
     }
 }
