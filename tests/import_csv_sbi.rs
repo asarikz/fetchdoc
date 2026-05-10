@@ -166,8 +166,8 @@ fx_fee_account   = "Expenses:支払手数料:海外事務手数料"
     assert!(salary.get("counterparty_guess").is_none_or(|v| v.is_null()));
     assert!(salary.get("splits").is_none_or(|v| v.is_null()));
 
-    // Step 2: export gnucash. The CLOUDFLARE row should produce 3 CSV rows:
-    // bank leg + 2 split continuations (Date empty on rows 2 & 3).
+    // Step 2: export gnucash. CLOUDFLARE → 3 split rows (bank + principal + FX fee),
+    // GOOGLE and salary → 2 split rows each (synthesised offset).
     let gnucash_path = tmp.join("gnucash.csv");
     let export_out = Command::cargo_bin("fetchdoc")
         .unwrap()
@@ -191,22 +191,24 @@ fx_fee_account   = "Expenses:支払手数料:海外事務手数料"
 
     let csv_text = std::fs::read_to_string(&gnucash_path).unwrap();
     let csv_lines: Vec<&str> = csv_text.lines().collect();
-    // Header + 1 (GOOGLE single) + 3 (CLOUDFLARE multi) + 1 (salary single) = 6
-    assert_eq!(csv_lines.len(), 6, "expected 6 CSV lines, got:\n{csv_text}");
+    // Header + 2 (GOOGLE) + 3 (CLOUDFLARE: bank + 2 splits) + 2 (salary) = 8
+    assert_eq!(csv_lines.len(), 8, "expected 8 CSV lines, got:\n{csv_text}");
 
-    // CLOUDFLARE bank leg (line 3): Date present, Withdrawal 2513.
-    assert!(csv_lines[2].contains("2026-05-12"));
-    assert!(csv_lines[2].contains("CLOUDFLARE"));
-    assert!(csv_lines[2].contains(",2513,"));
+    // CLOUDFLARE bank leg (line 4): negative bank-account amount.
+    assert!(csv_lines[3].contains("05/12/2026"));
+    assert!(csv_lines[3].contains("CLOUDFLARE"));
+    assert!(csv_lines[3].contains("Assets:Bank:SBI"));
+    assert!(csv_lines[3].contains(",-2513,"));
 
-    // First continuation: empty Date, Deposit=2452.
-    assert!(csv_lines[3].starts_with(","));
-    assert!(csv_lines[3].contains(",2452,"));
+    // Principal split (line 5): same Transaction ID, +2452.
+    let cloud_txid = csv_lines[3].split(',').nth(1).unwrap();
+    assert_eq!(csv_lines[4].split(',').nth(1).unwrap(), cloud_txid);
+    assert!(csv_lines[4].contains(",2452,"));
 
-    // FX fee continuation: empty Date, Deposit=61, FX expense account.
-    assert!(csv_lines[4].starts_with(","));
-    assert!(csv_lines[4].contains(",61,"));
-    assert!(csv_lines[4].contains("Expenses:支払手数料:海外事務手数料"));
+    // FX fee split (line 6): +61 to FX expense account.
+    assert_eq!(csv_lines[5].split(',').nth(1).unwrap(), cloud_txid);
+    assert!(csv_lines[5].contains(",61,"));
+    assert!(csv_lines[5].contains("Expenses:支払手数料:海外事務手数料"));
 }
 
 #[test]
