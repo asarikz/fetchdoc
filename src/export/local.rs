@@ -27,7 +27,11 @@ pub struct LocalArgs {
 
     /// Filename template. Placeholders:
     /// `{yyyy-mm-dd}` `{yyyy}` `{mm}` `{dd}` `{counterparty_name}`
-    /// `{total_amount}` `{external_id}` `{source}`.
+    /// `{total_amount}` `{external_id}` `{source}`
+    /// `{document_type}` (`invoice`/`receipt`/`other`)
+    /// `{document_type_ja}` (`請求書`/`領収書`/`その他`).
+    /// `{document_type*}` placeholders render to an empty string when classify
+    /// did not set the document type — wrap them in template glue accordingly.
     /// May contain `/` to fan into subdirectories (e.g. `{yyyy}/{mm}/...`).
     #[arg(
         long,
@@ -107,6 +111,8 @@ fn render_template(template: &str, doc: &Document, extracted: &Extracted) -> Str
     let (yyyy, mm, dd) = split_iso_date(date);
     let amount = extracted.total_amount_jpy.to_string();
     let name = sanitize_filename_component(&extracted.counterparty_name);
+    let doc_type_en = extracted.document_type.map(|t| t.en()).unwrap_or("");
+    let doc_type_ja = extracted.document_type.map(|t| t.ja()).unwrap_or("");
 
     let mut out = String::with_capacity(template.len() + 32);
     let mut rest = template;
@@ -129,6 +135,8 @@ fn render_template(template: &str, doc: &Document, extracted: &Extracted) -> Str
             "total_amount" => amount.as_str(),
             "external_id" => doc.external_id.as_str(),
             "source" => doc.source.as_str(),
+            "document_type" => doc_type_en,
+            "document_type_ja" => doc_type_ja,
             _ => {
                 // Unknown placeholder: re-emit literally.
                 out.push('{');
@@ -208,7 +216,7 @@ fn merge_exported(prev: Option<serde_json::Value>, dest: &Path) -> serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{Document, Extracted};
+    use crate::io::{Document, DocumentType, Extracted};
 
     fn doc() -> Document {
         Document {
@@ -221,6 +229,7 @@ mod tests {
                 total_amount_jpy: 12100,
                 counterparty_name: "アクメ商事".into(),
                 counterparty_t_number: None,
+                document_type: None,
                 confidence: 0.9,
             }),
             exported: None,
@@ -256,6 +265,38 @@ mod tests {
         d.extracted.as_mut().unwrap().counterparty_name = "A/B:C*D".into();
         let name = render_template("{counterparty_name}.pdf", &d, d.extracted.as_ref().unwrap());
         assert_eq!(name, "A_B_C_D.pdf");
+    }
+
+    #[test]
+    fn document_type_placeholders_render_jp_and_en() {
+        let mut d = doc();
+        d.extracted.as_mut().unwrap().document_type = Some(DocumentType::Receipt);
+        let name = render_template(
+            "{yyyy-mm-dd}_{counterparty_name}_{total_amount}円_{document_type_ja}.pdf",
+            &d,
+            d.extracted.as_ref().unwrap(),
+        );
+        assert_eq!(name, "2026-04-30_アクメ商事_12100円_領収書.pdf");
+
+        let name_en = render_template(
+            "{yyyy-mm-dd}_{document_type}_{external_id}.pdf",
+            &d,
+            d.extracted.as_ref().unwrap(),
+        );
+        assert_eq!(name_en, "2026-04-30_receipt_abc123.pdf");
+    }
+
+    #[test]
+    fn document_type_placeholder_empty_when_unknown() {
+        // None → render to empty string so the rest of the template still
+        // produces something usable rather than `{document_type_ja}` lingering.
+        let d = doc();
+        let name = render_template(
+            "{yyyy-mm-dd}_{counterparty_name}_{document_type_ja}.pdf",
+            &d,
+            d.extracted.as_ref().unwrap(),
+        );
+        assert_eq!(name, "2026-04-30_アクメ商事_.pdf");
     }
 
     #[test]
