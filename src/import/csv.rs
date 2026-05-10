@@ -15,8 +15,16 @@ use std::path::PathBuf;
 #[derive(Args, Debug)]
 pub struct CsvArgs {
     /// Input CSV path. Use `-` for stdin (UTF-8 only — encoding decoding is
-    /// driven by the profile and only fires for file inputs).
-    pub input: String,
+    /// driven by the profile and only fires for file inputs). Mutually
+    /// exclusive with `--dir`.
+    #[arg(required_unless_present = "dir", conflicts_with = "dir")]
+    pub input: Option<String>,
+
+    /// Directory containing two related CSVs (e.g. SBI Sumishin's
+    /// `nyushukinmeisai_*.csv` + `meisai_*.csv`). Requires a profile with a
+    /// `[multi]` section. Mutually exclusive with `input` and `--infer`.
+    #[arg(long, conflicts_with_all = ["input", "infer"])]
+    pub dir: Option<PathBuf>,
 
     /// Profile name (looked up in `~/.config/fetchdoc/profiles/`) or path
     /// to a `.toml` file. Required; auto-inference is a separate flag.
@@ -51,8 +59,16 @@ pub async fn run(args: CsvArgs) -> anyhow::Result<()> {
     let profile = Profile::resolve(profile_value)
         .with_context(|| format!("loading profile {profile_value}"))?;
 
-    let bytes = read_input_bytes(&args.input)?;
-    run_with_bytes(&bytes, &profile, &args.input, args.quiet)
+    if let Some(dir) = args.dir.as_deref() {
+        return super::multi::run(&profile, dir, args.quiet);
+    }
+
+    let input = args
+        .input
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("internal: missing input path"))?;
+    let bytes = read_input_bytes(input)?;
+    run_with_bytes(&bytes, &profile, input, args.quiet)
 }
 
 /// Decode `bytes` per `profile` and emit Transaction JSONL on stdout.
@@ -218,6 +234,15 @@ pub(super) fn build_index(
     })
 }
 
+pub(super) fn build_transaction_public(
+    rec: &csv::StringRecord,
+    idx: &ColumnIndex,
+    profile: &Profile,
+    source_label: &str,
+) -> anyhow::Result<Transaction> {
+    build_transaction(rec, idx, profile, "csv", source_label)
+}
+
 fn build_transaction(
     rec: &csv::StringRecord,
     idx: &ColumnIndex,
@@ -290,6 +315,7 @@ fn build_transaction(
         counterparty_guess: None,
         memo,
         category_guess: None,
+        splits: None,
         source_meta: Some(json!({ "input": source_label })),
         exported: None,
         status,

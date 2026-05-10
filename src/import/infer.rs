@@ -24,20 +24,24 @@ const HEAD_LINES: usize = 50;
 const MAX_TOKENS: u32 = 1024;
 
 pub async fn run_csv(args: &CsvArgs) -> anyhow::Result<()> {
-    if args.input == "-" {
+    let input = args
+        .input
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--infer requires a file path argument"))?;
+    if input == "-" {
         anyhow::bail!(
             "import csv --infer requires a file path; profile generation needs to peek \
              at the head of a seekable file (stdin would be consumed)."
         );
     }
 
-    let bytes = super::csv::read_input_bytes(&args.input)?;
+    let bytes = super::csv::read_input_bytes(input)?;
     let (head_text, sniffed_encoding) = sniff_head(&bytes);
-    let name = profile_name(args.name.as_deref(), &args.input)?;
+    let name = profile_name(args.name.as_deref(), input)?;
 
     let profile = run_inference(&name, sniffed_encoding, &head_text, args.quiet).await?;
 
-    super::csv::run_with_bytes(&bytes, &profile, &args.input, args.quiet)
+    super::csv::run_with_bytes(&bytes, &profile, input, args.quiet)
 }
 
 pub async fn run_xlsx(args: &XlsxArgs) -> anyhow::Result<()> {

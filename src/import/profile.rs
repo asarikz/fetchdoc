@@ -41,6 +41,15 @@ pub struct Profile {
 
     /// Column-name mapping.
     pub columns: Columns,
+
+    /// Optional secondary-source join config. When set, the importer expects
+    /// `--dir <path>` instead of a single file: it reads files matching
+    /// `multi.primary_glob` (using the top-level columns/encoding) and
+    /// `multi.debit.glob`, joins them by (date ± window, total amount), and
+    /// emits one [`Transaction`](crate::io::Transaction) per primary row with
+    /// `splits` filled in for matched debit rows.
+    #[serde(default)]
+    pub multi: Option<MultiConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +85,127 @@ pub struct Columns {
     /// Value/effective date column. Optional.
     #[serde(default)]
     pub value_date: Option<String>,
+}
+
+/// Two-file join config (e.g. SBI Sumishin: bank statement + debit-card detail).
+/// The top-level [`Profile`] describes the primary file; this struct adds the
+/// secondary "detail" file and how to join them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MultiConfig {
+    /// Glob (relative to `--dir`) matching the primary statement files.
+    /// Example: `"nyushukinmeisai_*.csv"`.
+    pub primary_glob: String,
+    /// Regex applied to the primary `description` column. Only rows that match
+    /// are joined against the debit file; non-matching rows pass through as
+    /// plain (single-split) transactions. Capture groups are saved into
+    /// `source_meta.debit_ref` (only the first named group, if any).
+    #[serde(default)]
+    pub primary_match_regex: Option<String>,
+    /// Secondary "detail" file config.
+    pub debit: DebitFile,
+    /// Join parameters.
+    #[serde(default)]
+    pub join: JoinConfig,
+}
+
+/// Debit-card / detail-file profile. Independent encoding, headers, columns —
+/// SBI Sumishin's two CSVs share Shift_JIS but other banks may differ.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DebitFile {
+    /// Glob (relative to `--dir`) matching the debit detail files.
+    pub glob: String,
+    #[serde(default = "default_encoding")]
+    pub encoding: String,
+    #[serde(default = "default_delimiter")]
+    pub delimiter: String,
+    #[serde(default = "default_header_row")]
+    pub header_row: usize,
+    #[serde(default)]
+    pub skip_rows: usize,
+    #[serde(default = "default_date_format")]
+    pub date_format: String,
+    /// Optional row filter: keep only rows whose `column` cell equals `value`.
+    /// SBI Sumishin's debit CSV has a leading marker column (header text `"1"`,
+    /// data-row value `"2"`); set this to skip any non-`"2"` rows.
+    #[serde(default)]
+    pub row_filter: Option<RowFilter>,
+    /// Column-name mapping for the debit file.
+    pub columns: DebitColumns,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RowFilter {
+    /// Column header text in the debit file.
+    pub column: String,
+    /// Required cell value; rows whose cell equals this are kept.
+    pub value: String,
+}
+
+/// Column mapping for the debit detail file. All columns optional except
+/// `date`, `merchant`, and `tx_amount` — those three are needed to join and
+/// produce a useful split.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DebitColumns {
+    /// Transaction date on the debit slip (`お取引日`).
+    pub date: String,
+    /// Merchant / counterparty name (`お取引内容`).
+    pub merchant: String,
+    /// Settled JPY amount (`お取引金額`) — the principal in the bank's reporting currency.
+    pub tx_amount: String,
+    /// Per-transaction fee (`お取引手数料`). Optional; treated as 0 if missing or blank.
+    #[serde(default)]
+    pub tx_fee: Option<String>,
+    /// ATM fee (`ATM手数料`). Optional.
+    #[serde(default)]
+    pub atm_fee: Option<String>,
+    /// FX handling fee (`海外事務手数料`). Optional; if set and non-zero, gets its own split.
+    #[serde(default)]
+    pub fx_fee: Option<String>,
+    /// Foreign currency code (`ご利用通貨`). Optional, recorded in `source_meta`.
+    #[serde(default)]
+    pub use_currency: Option<String>,
+    /// Foreign-currency amount (`ご利用金額`). Optional, recorded in `source_meta`.
+    #[serde(default)]
+    pub use_amount: Option<String>,
+    /// FX rate (`換算レート`). Optional, recorded in `source_meta`.
+    #[serde(default)]
+    pub rate: Option<String>,
+}
+
+/// How to match primary rows to debit rows.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JoinConfig {
+    /// ± days tolerated between the primary `posted_date` and the debit `date`.
+    /// SBI typically posts a debit purchase on the merchant's settlement day
+    /// (1-3 business days after the slip date), so a window of a few days
+    /// catches the offset without false matches. Defaults to 7.
+    #[serde(default = "default_date_window")]
+    pub date_window_days: u32,
+    /// GnuCash account name to use for the FX fee split. If `None`, the export
+    /// falls back to `--default-other`.
+    #[serde(default)]
+    pub fx_fee_account: Option<String>,
+    /// GnuCash account name for the per-transaction fee split. Optional.
+    #[serde(default)]
+    pub tx_fee_account: Option<String>,
+    /// GnuCash account name for the ATM fee split. Optional.
+    #[serde(default)]
+    pub atm_fee_account: Option<String>,
+}
+
+impl Default for JoinConfig {
+    fn default() -> Self {
+        Self {
+            date_window_days: default_date_window(),
+            fx_fee_account: None,
+            tx_fee_account: None,
+            atm_fee_account: None,
+        }
+    }
+}
+
+fn default_date_window() -> u32 {
+    7
 }
 
 fn default_encoding() -> String {
@@ -122,17 +252,7 @@ impl Profile {
 
     /// Return the byte-level delimiter (`csv` crate wants a single byte).
     pub fn delimiter_byte(&self) -> anyhow::Result<u8> {
-        let bytes = self.delimiter.as_bytes();
-        match bytes {
-            [b] => Ok(*b),
-            // accept the common escape `\t`
-            b"\\t" => Ok(b'\t'),
-            _ => anyhow::bail!(
-                "profile {}: delimiter must be a single byte, got {:?}",
-                self.name,
-                self.delimiter
-            ),
-        }
+        delimiter_byte(&self.delimiter, &self.name)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -151,6 +271,20 @@ impl Profile {
             );
         }
         Ok(())
+    }
+}
+
+impl DebitFile {
+    pub fn delimiter_byte(&self) -> anyhow::Result<u8> {
+        delimiter_byte(&self.delimiter, "multi.debit")
+    }
+}
+
+fn delimiter_byte(s: &str, who: &str) -> anyhow::Result<u8> {
+    match s.as_bytes() {
+        [b] => Ok(*b),
+        b"\\t" => Ok(b'\t'),
+        _ => anyhow::bail!("{who}: delimiter must be a single byte, got {s:?}"),
     }
 }
 
