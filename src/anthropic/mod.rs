@@ -73,6 +73,30 @@ impl Client {
         blocks: &[UserBlock],
         max_tokens: u32,
     ) -> anyhow::Result<String> {
+        self.complete_full(SystemPrompt::Plain(system), blocks, max_tokens)
+            .await
+    }
+
+    /// Like [`Self::complete_with_blocks`] but lets the caller mark the system
+    /// prompt as cacheable. Use when a long static prefix (e.g. a chart of
+    /// accounts) is reused across many calls — the API caches it for ~5 min
+    /// at a fraction of the per-call cost.
+    pub async fn complete_with_cached_system(
+        &self,
+        system: &str,
+        blocks: &[UserBlock],
+        max_tokens: u32,
+    ) -> anyhow::Result<String> {
+        self.complete_full(SystemPrompt::Cached(system), blocks, max_tokens)
+            .await
+    }
+
+    async fn complete_full(
+        &self,
+        system: SystemPrompt<'_>,
+        blocks: &[UserBlock],
+        max_tokens: u32,
+    ) -> anyhow::Result<String> {
         let content: Vec<ContentBlockOut> = blocks
             .iter()
             .map(|b| match b {
@@ -90,7 +114,14 @@ impl Client {
         let req = MessagesRequest {
             model: &self.model,
             max_tokens,
-            system: Some(system),
+            system: match system {
+                SystemPrompt::Plain(s) => Some(SystemField::Plain(s)),
+                SystemPrompt::Cached(s) => Some(SystemField::Blocks(vec![SystemBlock {
+                    kind: "text",
+                    text: s,
+                    cache_control: Some(CacheControl { kind: "ephemeral" }),
+                }])),
+            },
             messages: vec![BlockMessage {
                 role: "user",
                 content,
@@ -133,13 +164,40 @@ pub enum UserBlock {
     Pdf(Vec<u8>),
 }
 
+enum SystemPrompt<'a> {
+    Plain(&'a str),
+    Cached(&'a str),
+}
+
 #[derive(Serialize)]
 struct MessagesRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<SystemField<'a>>,
     messages: Vec<BlockMessage<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SystemField<'a> {
+    Plain(&'a str),
+    Blocks(Vec<SystemBlock<'a>>),
+}
+
+#[derive(Serialize)]
+struct SystemBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
