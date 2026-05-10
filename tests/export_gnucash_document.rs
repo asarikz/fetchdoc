@@ -199,6 +199,102 @@ fn document_input_requires_credit_account() {
     assert!(err.contains("--credit-account"), "got: {err}");
 }
 
+#[test]
+fn picker_mode_rejects_empty_chart_before_writing_csv() {
+    let tmp = tempdir();
+    let csv_path = tmp.join("ap.csv");
+    let chart_path = tmp.join("accounts.txt");
+    std::fs::write(&chart_path, "# nothing but a comment\n\n").unwrap();
+
+    let jsonl = serde_json::json!({
+        "source": "gmail",
+        "external_id": "x",
+        "attachment_path": "/p.pdf",
+        "extracted": {
+            "transaction_date": "2026-04-30",
+            "total_amount_jpy": 1,
+            "counterparty_name": "X",
+            "confidence": 1.0
+        },
+        "status": "ok"
+    })
+    .to_string()
+        + "\n";
+
+    let out = Command::cargo_bin("fetchdoc")
+        .unwrap()
+        .args([
+            "export",
+            "gnucash",
+            "--out",
+            csv_path.to_str().unwrap(),
+            "--accounts",
+            chart_path.to_str().unwrap(),
+            "--credit-account",
+            "Liabilities:買掛金",
+            "--quiet",
+        ])
+        .write_stdin(jsonl)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("empty"), "got: {err}");
+    // CSV must NOT have been opened/truncated when init fails.
+    assert!(
+        !csv_path.exists(),
+        "csv file should not be created on init error"
+    );
+}
+
+#[test]
+fn picker_mode_without_api_key_errors_with_friendly_message() {
+    let tmp = tempdir();
+    let csv_path = tmp.join("ap.csv");
+    let chart_path = tmp.join("accounts.txt");
+    std::fs::write(
+        &chart_path,
+        "Expenses:通信費\nExpenses:消耗品費\nLiabilities:買掛金\n",
+    )
+    .unwrap();
+
+    let jsonl = serde_json::json!({
+        "source": "gmail",
+        "external_id": "x",
+        "attachment_path": "/p.pdf",
+        "extracted": {
+            "transaction_date": "2026-04-30",
+            "total_amount_jpy": 1,
+            "counterparty_name": "X",
+            "confidence": 1.0
+        },
+        "status": "ok"
+    })
+    .to_string()
+        + "\n";
+
+    let out = Command::cargo_bin("fetchdoc")
+        .unwrap()
+        .env_remove("ANTHROPIC_API_KEY")
+        .args([
+            "export",
+            "gnucash",
+            "--out",
+            csv_path.to_str().unwrap(),
+            "--accounts",
+            chart_path.to_str().unwrap(),
+            "--credit-account",
+            "Liabilities:買掛金",
+            "--quiet",
+        ])
+        .write_stdin(jsonl)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("ANTHROPIC_API_KEY"), "got: {err}");
+}
+
 fn tempdir() -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()

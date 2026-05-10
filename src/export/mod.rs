@@ -9,6 +9,7 @@
 
 use clap::{Args, Subcommand};
 
+mod accounts;
 mod gnucash;
 mod local;
 

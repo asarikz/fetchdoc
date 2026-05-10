@@ -21,11 +21,13 @@
 //! After writing the CSV, each record is re-emitted on stdout with
 //! `exported.gnucash = ...` so further export targets can chain.
 
+use crate::export::accounts::{Chart, Pick, pick_debit_account};
 use crate::io::{Document, Split, Transaction, write_jsonl_stdout};
 use anyhow::Context;
 use clap::Args;
 use serde_json::json;
 use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Args, Debug)]
 pub struct GnucashArgs {
@@ -46,7 +48,8 @@ pub struct GnucashArgs {
     pub default_other: String,
 
     /// **Document input only.** Account to debit (the expense side of the
-    /// invoice). Example: `Expenses:諸経費`.
+    /// invoice). Example: `Expenses:諸経費`. When `--accounts` is also given,
+    /// this becomes the *fallback* used only if the picker can't choose.
     #[arg(long)]
     pub debit_account: Option<String>,
 
@@ -54,6 +57,14 @@ pub struct GnucashArgs {
     /// Example: `Liabilities:買掛金` for accrual, `Assets:Cash` for cash purchases.
     #[arg(long)]
     pub credit_account: Option<String>,
+
+    /// **Document input only.** Path to a GnuCash chart-of-accounts file (one
+    /// fully-qualified account per line, `#` comments allowed). When set, the
+    /// expense (debit) account is chosen per-document by an LLM call against
+    /// this list. The chart goes in a cached system prompt so per-call cost
+    /// is small. Falls back to `--debit-account` when the model can't pick.
+    #[arg(long)]
+    pub accounts: Option<PathBuf>,
 
     /// Currency commodity code. Defaults to JPY.
     #[arg(long, default_value = "JPY")]
@@ -68,6 +79,26 @@ pub async fn run(args: GnucashArgs) -> anyhow::Result<()> {
     if args.out == "-" {
         anyhow::bail!("--out '-' (stdout) conflicts with the JSONL passthrough; pass a file path");
     }
+
+    // Set up the LLM picker if --accounts was provided. We load the chart
+    // up-front so a malformed file fails before the CSV gets written.
+    let picker = match &args.accounts {
+        Some(path) => {
+            let chart = Chart::load(path)?;
+            let client = crate::anthropic::Client::from_env().context(
+                "--accounts requires Anthropic credentials for per-document account selection",
+            )?;
+            if !args.quiet {
+                eprintln!(
+                    "export gnucash: loaded {} accounts from {}",
+                    chart.len(),
+                    path.display()
+                );
+            }
+            Some(PickerCtx { chart, client })
+        }
+        None => None,
+    };
 
     let file =
         std::fs::File::create(&args.out).with_context(|| format!("creating {}", args.out))?;
@@ -98,7 +129,7 @@ pub async fn run(args: GnucashArgs) -> anyhow::Result<()> {
             RecordKind::Document => {
                 let mut doc: Document =
                     serde_json::from_value(value).context("decoding record as Document")?;
-                let Some(extracted) = doc.extracted.as_ref() else {
+                let Some(extracted) = doc.extracted.clone() else {
                     doc.status = "needs_review".to_string();
                     skipped += 1;
                     if !args.quiet {
@@ -110,16 +141,75 @@ pub async fn run(args: GnucashArgs) -> anyhow::Result<()> {
                     write_jsonl_stdout(&doc)?;
                     continue;
                 };
-                let debit = args.debit_account.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("Document record requires --debit-account (the expense side)")
-                })?;
                 let credit = args.credit_account.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Document record requires --credit-account (the payable / cash side)"
                     )
                 })?;
-                write_document_row(&mut wtr, &doc, extracted, debit, credit, &args)?;
-                doc.exported = Some(merge_exported(doc.exported.take(), &args.out));
+
+                // Decide the debit (expense) account: ask the LLM if --accounts
+                // was given, otherwise use the fixed --debit-account.
+                let (debit, debit_source, picker_note) = match &picker {
+                    Some(ctx) => {
+                        match pick_debit_account(&ctx.client, &ctx.chart, &doc, &extracted).await {
+                            Ok(Pick::Picked(name)) => (name, "picker", None),
+                            Ok(Pick::Fallback { reason }) => {
+                                doc.status = "needs_review".to_string();
+                                let fallback = args.debit_account.clone().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "picker could not choose an account ({reason}) and \
+                                     --debit-account fallback is not set"
+                                    )
+                                })?;
+                                if !args.quiet {
+                                    eprintln!(
+                                        "export gnucash: {} → fallback {fallback} ({reason})",
+                                        doc.external_id
+                                    );
+                                }
+                                (fallback, "fallback", Some(reason))
+                            }
+                            Err(e) => {
+                                // Network / API error — fall back too rather than
+                                // aborting the whole batch, so a flaky call doesn't
+                                // lose CSV rows we already wrote.
+                                doc.status = "needs_review".to_string();
+                                let fallback = args.debit_account.clone().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "picker call failed ({e:#}) and --debit-account fallback \
+                                     is not set"
+                                    )
+                                })?;
+                                let reason = format!("picker error: {e:#}");
+                                if !args.quiet {
+                                    eprintln!(
+                                        "export gnucash: {} → fallback {fallback} ({reason})",
+                                        doc.external_id
+                                    );
+                                }
+                                (fallback, "fallback", Some(reason))
+                            }
+                        }
+                    }
+                    None => {
+                        let d = args.debit_account.clone().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Document record requires --debit-account (the expense side) \
+                                 or --accounts for picker mode"
+                            )
+                        })?;
+                        (d, "fixed", None)
+                    }
+                };
+
+                write_document_row(&mut wtr, &doc, &extracted, &debit, credit, &args)?;
+                doc.exported = Some(merge_exported_doc(
+                    doc.exported.take(),
+                    &args.out,
+                    &debit,
+                    debit_source,
+                    picker_note.as_deref(),
+                ));
                 write_jsonl_stdout(&doc)?;
                 written += 1;
             }
@@ -327,4 +417,39 @@ fn merge_exported(prev: Option<serde_json::Value>, out_path: &str) -> serde_json
     };
     obj.insert("gnucash".into(), json!({ "out": out_path }));
     serde_json::Value::Object(obj)
+}
+
+/// Document-flavoured `exported.gnucash` payload: includes which debit account
+/// was used and how it was chosen (picker / fallback / fixed) so the user can
+/// audit picker accuracy without re-running the export.
+fn merge_exported_doc(
+    prev: Option<serde_json::Value>,
+    out_path: &str,
+    debit_account: &str,
+    debit_source: &str,
+    picker_note: Option<&str>,
+) -> serde_json::Value {
+    let mut obj = match prev {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let mut payload = json!({
+        "out": out_path,
+        "debit_account": debit_account,
+        "debit_source": debit_source,
+    });
+    if let Some(note) = picker_note {
+        payload
+            .as_object_mut()
+            .expect("payload is an object literal")
+            .insert("picker_note".into(), serde_json::Value::String(note.into()));
+    }
+    obj.insert("gnucash".into(), payload);
+    serde_json::Value::Object(obj)
+}
+
+/// Borrowed bundle of picker state held by `run` for the duration of the batch.
+struct PickerCtx {
+    chart: Chart,
+    client: crate::anthropic::Client,
 }
