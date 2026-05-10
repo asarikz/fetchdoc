@@ -12,11 +12,11 @@ use anyhow::Context;
 use clap::{Args, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-mod google;
+pub(crate) mod google;
 mod loopback;
-mod paths;
+pub(crate) mod paths;
 mod pkce;
-mod storage;
+pub(crate) mod storage;
 
 #[derive(Args, Debug)]
 pub struct AuthArgs {

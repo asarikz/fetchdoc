@@ -104,10 +104,9 @@ pub fn build_auth_url(
 /// `expires_in`, `token_type`, `scope`) we deliberately ignore.
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
-    /// Short-lived bearer token. Not persisted by `auth login` (we keep only
-    /// the `refresh_token`); kept on the struct so `fetch gmail` can reuse
-    /// the same `exchange_*` plumbing once we add a refresh path.
-    #[allow(dead_code)]
+    /// Short-lived bearer token. `auth login` discards it (only the
+    /// refresh_token is persisted); `fetch gmail` re-acquires one per run via
+    /// [`refresh_access_token`].
     pub access_token: String,
     /// Present on the **first** consent (or every consent if
     /// `prompt=consent` was passed). Subsequent silent re-auths omit it.
@@ -141,6 +140,38 @@ pub async fn exchange_code(
         anyhow::bail!("token exchange failed ({status}): {body}");
     }
     serde_json::from_str(&body).with_context(|| format!("parsing token response: {body}"))
+}
+
+/// Use a stored refresh_token to obtain a fresh short-lived access token. A
+/// 401/`invalid_grant` here usually means the user revoked access; the caller
+/// should ask them to re-run `fetchdoc auth login`.
+pub async fn refresh_access_token(
+    secret: &ClientSecret,
+    refresh_token: &str,
+    http: &reqwest::Client,
+) -> anyhow::Result<String> {
+    let resp = http
+        .post(secret.token_url())
+        .form(&[
+            ("client_id", secret.client_id.as_str()),
+            ("client_secret", secret.client_secret.as_str()),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .context("posting to token endpoint")?;
+    let status = resp.status();
+    let body = resp.text().await.context("reading token endpoint body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "refresh_token exchange failed ({status}): {body}. \
+             If this persists, re-run `fetchdoc auth login --source gmail`."
+        );
+    }
+    let token: TokenResponse =
+        serde_json::from_str(&body).with_context(|| format!("parsing token response: {body}"))?;
+    Ok(token.access_token)
 }
 
 #[cfg(test)]
