@@ -53,19 +53,25 @@ GitHub Release once the v0.1 milestone closes.
 ## Local mail import (no OAuth)
 
 If you'd rather not — or can't — set up a Google Cloud OAuth client, point
-fetchdoc at a folder of `.eml` files instead. Apple Mail, Thunderbird,
-Outlook, Google Takeout, and `offlineimap` / `mbsync` can all produce these.
+fetchdoc at local mail files instead. Apple Mail, Thunderbird, Outlook,
+Google Takeout, and `offlineimap` / `mbsync` can all produce these.
 
 ```sh
-# Drop a few .eml files into ~/mail-export/ first.
+# A folder of individual .eml files (Thunderbird "Save As", drag-out from Mail).
 fetchdoc fetch eml --dir ~/mail-export --since 2026-04-01 > raw.jsonl
+
+# Or an mbox archive — Apple Mail's "Save Mailbox", Thunderbird's per-folder
+# files, Google Takeout's `All mail.mbox`, mbsync mboxrd output.
+fetchdoc fetch mbox --file ~/Takeout/Mail/All\ mail.mbox --since 2026-04-01 > raw.jsonl
+fetchdoc fetch mbox --dir  ~/Library/Mail/V10                                > raw.jsonl
+
 ANTHROPIC_API_KEY=sk-ant-... fetchdoc classify < raw.jsonl > classified.jsonl
 fetchdoc export local --root ~/受領請求書 < classified.jsonl
 ```
 
-`fetch eml` recurses into subdirectories, extracts every PDF attachment into
-a cache directory, and emits the same Document JSONL that `fetch gmail`
-will produce — so the rest of the pipeline is identical.
+Both subcommands extract every PDF attachment into a cache directory and
+emit the same Document JSONL that `fetch gmail` will produce — so the rest
+of the pipeline is identical.
 
 ## Quick start
 
@@ -98,6 +104,7 @@ fetchdoc export gnucash \
 | `auth init / login / status / logout` | — | OS keychain |
 | `fetch gmail` | — | JSONL of `Document` records |
 | `fetch eml --dir PATH` | — | JSONL of `Document` records (no OAuth) |
+| `fetch mbox --file PATH` / `--dir PATH` | — | JSONL of `Document` records (no OAuth) |
 | `classify [--ocr=anthropic\|vertex\|openai]` | JSONL | JSONL with `extracted` field |
 | `export local --root PATH` | JSONL | files + JSONL with `exported` field |
 | `export gnucash --out CSV` | JSONL | CSV file + JSONL |
