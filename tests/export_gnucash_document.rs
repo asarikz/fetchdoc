@@ -312,6 +312,187 @@ fn picker_mode_without_api_key_errors_with_friendly_message() {
     assert!(err.contains("ANTHROPIC_API_KEY"), "got: {err}");
 }
 
+#[test]
+fn invoice_and_receipt_pair_dedups_to_single_csv_row() {
+    // Amazon-style: same purchase shows up once as 請求書 and once as
+    // 領収書 (different external_id and attachment, identical extracted
+    // fields). Default behaviour should write one CSV row (the receipt) and
+    // emit the invoice as a passthrough with `suppressed_as_duplicate`.
+    let tmp = tempdir();
+    let csv_path = tmp.join("ap.csv");
+
+    let jsonl = format!(
+        "{}\n{}\n{}\n",
+        serde_json::json!({
+            "source": "local",
+            "external_id": "amzn-invoice",
+            "attachment_path": "/cache/invoice.pdf",
+            "extracted": {
+                "transaction_date": "2026-04-30",
+                "total_amount_jpy": 1980,
+                "counterparty_name": "Amazon",
+                "document_type": "invoice",
+                "confidence": 0.95
+            },
+            "status": "ok"
+        }),
+        serde_json::json!({
+            "source": "local",
+            "external_id": "amzn-receipt",
+            "attachment_path": "/cache/receipt.pdf",
+            "extracted": {
+                "transaction_date": "2026-04-30",
+                "total_amount_jpy": 1980,
+                "counterparty_name": "Amazon",
+                "document_type": "receipt",
+                "confidence": 0.95
+            },
+            "status": "ok"
+        }),
+        // Unrelated third record should pass through normally.
+        serde_json::json!({
+            "source": "gmail",
+            "external_id": "other",
+            "attachment_path": "/cache/other.pdf",
+            "extracted": {
+                "transaction_date": "2026-05-01",
+                "total_amount_jpy": 500,
+                "counterparty_name": "B社",
+                "document_type": "receipt",
+                "confidence": 0.9
+            },
+            "status": "ok"
+        })
+    );
+
+    let out = assert_cmd::Command::cargo_bin("fetchdoc")
+        .unwrap()
+        .args([
+            "export",
+            "gnucash",
+            "--out",
+            csv_path.to_str().unwrap(),
+            "--debit-account",
+            "Expenses:諸経費",
+            "--credit-account",
+            "Liabilities:買掛金",
+            "--quiet",
+        ])
+        .write_stdin(jsonl)
+        .output()
+        .expect("run export gnucash");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let csv_text = std::fs::read_to_string(&csv_path).unwrap();
+    let lines: Vec<&str> = csv_text.lines().collect();
+    // Header + 4 split rows: Amazon dedup'd to one transaction (debit + credit
+    // = 2 rows), plus B社 (also 2 rows).
+    assert_eq!(lines.len(), 5, "csv: {csv_text}");
+    let amazon_rows = lines.iter().filter(|l| l.contains("Amazon")).count();
+    assert_eq!(
+        amazon_rows, 2,
+        "Amazon should be one transaction = 2 split rows, got: {csv_text}"
+    );
+
+    // Stdout: 3 JSONL lines. Invoice (suppressed) gets the
+    // suppressed_as_duplicate marker; receipt (kept) gets the normal one.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let jl: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(jl.len(), 3);
+
+    let by_id: std::collections::HashMap<String, &serde_json::Value> = jl
+        .iter()
+        .map(|v| (v["external_id"].as_str().unwrap().to_string(), v))
+        .collect();
+    let kept = by_id["amzn-receipt"];
+    assert_eq!(kept["status"], "ok");
+    assert_eq!(
+        kept["exported"]["gnucash"]["debit_account"],
+        "Expenses:諸経費"
+    );
+    assert!(
+        kept["exported"]["gnucash"]
+            .get("suppressed_as_duplicate")
+            .is_none()
+    );
+
+    let suppressed = by_id["amzn-invoice"];
+    assert_eq!(suppressed["status"], "ok");
+    assert_eq!(
+        suppressed["exported"]["gnucash"]["suppressed_as_duplicate"],
+        true
+    );
+}
+
+#[test]
+fn keep_duplicates_flag_disables_dedup() {
+    let tmp = tempdir();
+    let csv_path = tmp.join("ap.csv");
+
+    let jsonl = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "source": "local",
+            "external_id": "amzn-invoice",
+            "attachment_path": "/cache/invoice.pdf",
+            "extracted": {
+                "transaction_date": "2026-04-30",
+                "total_amount_jpy": 1980,
+                "counterparty_name": "Amazon",
+                "document_type": "invoice",
+                "confidence": 0.95
+            },
+            "status": "ok"
+        }),
+        serde_json::json!({
+            "source": "local",
+            "external_id": "amzn-receipt",
+            "attachment_path": "/cache/receipt.pdf",
+            "extracted": {
+                "transaction_date": "2026-04-30",
+                "total_amount_jpy": 1980,
+                "counterparty_name": "Amazon",
+                "document_type": "receipt",
+                "confidence": 0.95
+            },
+            "status": "ok"
+        })
+    );
+
+    let out = assert_cmd::Command::cargo_bin("fetchdoc")
+        .unwrap()
+        .args([
+            "export",
+            "gnucash",
+            "--out",
+            csv_path.to_str().unwrap(),
+            "--debit-account",
+            "Expenses:諸経費",
+            "--credit-account",
+            "Liabilities:買掛金",
+            "--keep-duplicates",
+            "--quiet",
+        ])
+        .write_stdin(jsonl)
+        .output()
+        .expect("run export gnucash");
+    assert!(out.status.success());
+
+    let csv_text = std::fs::read_to_string(&csv_path).unwrap();
+    let lines: Vec<&str> = csv_text.lines().collect();
+    // Header + 4 split rows (both Amazon docs kept, each = 2 rows).
+    assert_eq!(lines.len(), 5);
+    let amazon_rows = lines.iter().filter(|l| l.contains("Amazon")).count();
+    assert_eq!(amazon_rows, 4);
+}
+
 fn tempdir() -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()

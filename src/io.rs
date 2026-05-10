@@ -55,8 +55,50 @@ pub struct Extracted {
     /// Qualified-invoice registration number, if present (`T` + 13 digits).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterparty_t_number: Option<String>,
+    /// Document type — invoice (請求書), receipt (領収書), or other.
+    /// Lets `export local` filename templates distinguish 請求書/領収書, and
+    /// lets `export gnucash` collapse the common Amazon-style invoice+receipt
+    /// pair so a single transaction is not booked twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_type: Option<DocumentType>,
     /// Self-reported confidence from the OCR backend (0.0 .. 1.0).
     pub confidence: f64,
+}
+
+/// Whether the document is an invoice (請求書 — billing document, sent before
+/// payment), a receipt (領収書 — proof of payment, sent after), or something
+/// else (delivery note, statement, etc.). Used by `export local` for
+/// filename templating and by `export gnucash` for invoice/receipt dedup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocumentType {
+    /// 請求書 — billing document.
+    Invoice,
+    /// 領収書 — proof of payment.
+    Receipt,
+    /// Anything else (delivery note 納品書, statement 明細書, …).
+    Other,
+}
+
+impl DocumentType {
+    /// Japanese label used by the `{document_type_ja}` filename placeholder.
+    pub fn ja(self) -> &'static str {
+        match self {
+            Self::Invoice => "請求書",
+            Self::Receipt => "領収書",
+            Self::Other => "その他",
+        }
+    }
+
+    /// English label (matches the lowercase serde tag) used by
+    /// `{document_type}`.
+    pub fn en(self) -> &'static str {
+        match self {
+            Self::Invoice => "invoice",
+            Self::Receipt => "receipt",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// One row of the bank/card transaction pipeline. Produced by `import csv`

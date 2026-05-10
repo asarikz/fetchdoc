@@ -244,9 +244,14 @@ qualified-invoice fields:
   "total_amount_jpy": 12100,                 // 税込合計, integer JPY
   "counterparty_name": "アクメ株式会社",
   "counterparty_t_number": "T1234567890123", // null if not printed
+  "document_type": "receipt",                // "invoice" (請求書) | "receipt" (領収書) | "other"
   "confidence": 0.94
 }
 ```
+
+`document_type` lets `export local` template the Japanese label into the
+filename and lets `export gnucash` collapse Amazon-style invoice + receipt
+pairs to one accounting row — see the export sections below.
 
 Flags:
 
@@ -270,9 +275,24 @@ fetchdoc export local --root ~/受領請求書 < classified.jsonl
 Default filename template is `{yyyy-mm-dd}_{counterparty_name}_{total_amount}円.pdf`
 — a single directory listing already meets the 電帳法 search-by-three-fields
 requirement. Available placeholders: `{yyyy-mm-dd}` `{yyyy}` `{mm}` `{dd}`
-`{counterparty_name}` `{total_amount}` `{external_id}` `{source}`.
+`{counterparty_name}` `{total_amount}` `{external_id}` `{source}`
+`{document_type}` (`invoice`/`receipt`/`other`)
+`{document_type_ja}` (`請求書`/`領収書`/`その他`).
 Use `/` in `--name-template` to fan into subdirectories
 (e.g. `{yyyy}/{mm}/{yyyy-mm-dd}_...pdf`).
+
+Want the Japanese document type baked into the filename? Use:
+
+```sh
+fetchdoc export local --root ~/受領請求書 \
+  --name-template '{yyyy-mm-dd}_{counterparty_name}_{total_amount}円_{document_type_ja}.pdf' \
+  < classified.jsonl
+# → 2026-04-30_Amazon_1980円_領収書.pdf
+```
+
+When `classify` did not set `document_type` (older records, or the model
+genuinely could not tell), `{document_type*}` placeholders render to an
+empty string rather than the literal token.
 
 Records without `attachment_path` or `extracted` are passed through with
 `status = needs_review` and a stderr warning (never aborts).
@@ -290,6 +310,33 @@ fetchdoc export gnucash \
 For `Document` input it emits the classical accrual A/P pair (debit expense,
 credit payable). For `Transaction` input (see Pipeline 2) you pass `--account`
 instead — see below.
+
+##### Invoice / receipt deduplication
+
+Some vendors (Amazon が代表例) issue **both** a 請求書 and a 領収書 for the
+same purchase. Running both through the pipeline would otherwise book the
+same transaction twice. By default `export gnucash` groups Documents that
+share `(transaction_date, total_amount_jpy, counterparty_name)` and writes
+**one CSV row** per group, preferring the receipt (領収書) over the invoice
+(請求書) — that's the document the inbox-side ledger usually wants, and it
+also satisfies インボイス制度 input-tax-credit requirements when the receipt
+carries a T number.
+
+The non-winning records still flow through stdout, but with
+`exported.gnucash.suppressed_as_duplicate = true` instead of a CSV row
+pointer, so you can audit dedup decisions:
+
+```sh
+jq 'select(.exported.gnucash.suppressed_as_duplicate == true)' \
+  < gnucash-passthrough.jsonl
+```
+
+Pass `--keep-duplicates` to disable dedup and emit one CSV row per
+Document. Counterparties whose name differs between the invoice and the
+receipt (`Amazon.co.jp` vs `アマゾンジャパン合同会社`) are **not** grouped
+— that's deliberate, since false grouping would silently drop a real
+purchase. If you hit this in practice, normalise names upstream or run
+with `--keep-duplicates` and dedup yourself.
 
 ---
 
@@ -511,7 +558,7 @@ If something looks off, the [client_secret.json troubleshooting](#troubleshootin
 | `import xlsx [--profile NAME\|--infer] [--sheet NAME] FILE` | xlsx file | `Transaction` JSONL |
 | `import dedup --against FILE [--against FILE…]` | `Transaction` JSONL | filtered `Transaction` JSONL |
 | `export local --root PATH [--name-template TPL]` | `Document` JSONL | files + JSONL with `exported.local` |
-| `export gnucash --out CSV …` | `Document` or `Transaction` JSONL | CSV file + JSONL with `exported.gnucash` |
+| `export gnucash --out CSV [--keep-duplicates] …` | `Document` or `Transaction` JSONL | CSV file + JSONL with `exported.gnucash` |
 | `verify-tnumber TXXXXXXXXXXXXX` | — | one-line summary on stdout |
 
 ### Common conventions

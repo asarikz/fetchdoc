@@ -30,6 +30,7 @@ Return ONE JSON object and nothing else (no prose, no markdown fence). Schema:
     "total_amount_jpy": <integer>,         // 合計金額 in JPY, including tax. Integer yen, no commas
     "counterparty_name": "<string>",       // 取引先 — the issuing company / shop name as printed
     "counterparty_t_number": "T1234567890123" | null,   // 適格請求書登録番号 if printed: literal "T" + 13 digits
+    "document_type": "invoice" | "receipt" | "other",   // 請求書=invoice, 領収書=receipt, otherwise other
     "confidence": <number 0..1>            // your self-assessed confidence the above fields are right
   }
 
@@ -37,6 +38,10 @@ Rules:
 - transaction_date MUST be ISO 8601 (YYYY-MM-DD). Convert Japanese dates (令和n年, n月d日) to Gregorian.
 - total_amount_jpy is the customer-visible total (税込合計). No decimals — JPY has no minor unit.
 - counterparty_t_number must match exactly /^T\d{13}$/ or be null. Do not invent one.
+- document_type: choose by the document title / wording.
+    - "invoice"  — 請求書 / Invoice / Bill (issued before payment, asking the recipient to pay).
+    - "receipt"  — 領収書 / レシート / Receipt (issued after payment, acknowledging it has been received). Credit-card statements that say 「ご利用明細」 with a clearly paid status also count as receipt.
+    - "other"    — anything else (納品書, 見積書, 明細書, delivery note, quote, …) or genuinely unclear.
 - If a field is genuinely unreadable, lower `confidence` rather than guessing wildly.
 "#;
 
