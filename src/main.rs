@@ -1,5 +1,6 @@
 use clap::Parser;
 
+mod anthropic;
 mod auth;
 mod classify;
 mod cli;
